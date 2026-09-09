@@ -6,8 +6,12 @@ fn main() {
         // Without them the window can land on the integrated part, and on one
         // machine that meant the GUI died inside AMD's OpenGL driver before
         // main() ran -- no window, no log, nothing to report (#32, #23).
-        println!("cargo:rustc-link-arg-bins=/EXPORT:NvOptimusEnablement,DATA");
-        println!("cargo:rustc-link-arg-bins=/EXPORT:AmdPowerXpressRequestHighPerformance,DATA");
+        // `/EXPORT:` is MSVC linker syntax; the GNU toolchain uses a different
+        // mechanism, so only emit these flags for MSVC builds.
+        if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+            println!("cargo:rustc-link-arg-bins=/EXPORT:NvOptimusEnablement,DATA");
+            println!("cargo:rustc-link-arg-bins=/EXPORT:AmdPowerXpressRequestHighPerformance,DATA");
+        }
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/icon.ico");
         res.set("ProductName", "DLSS5oneclick");

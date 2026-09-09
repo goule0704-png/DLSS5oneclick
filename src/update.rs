@@ -6,12 +6,13 @@
 //! Replacing a running exe on Windows: rename the running file aside (allowed),
 //! move the new one into its place, start it, exit; the next start deletes the
 //! `.old` file. The user always decides: nothing is downloaded until they say so.
+use crate::lang;
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const REPO: &str = "faisalkindi/DLSS5oneclick";
+pub const REPO: &str = "goule0704-png/DLSS5oneclick";
 pub const CURRENT: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,18 +97,17 @@ pub fn download_and_swap(av: &Available, progress: &(dyn Fn(u8, &str) + Sync)) -
     let head = std::fs::read(&fresh)?;
     if meta.len() < 1_000_000 || head.get(..2) != Some(b"MZ") {
         let _ = std::fs::remove_file(&fresh);
-        bail!("downloaded file is not a valid executable");
+        bail!("{}", crate::trfmt!("downloaded file is not a valid executable", "下载的文件不是有效的可执行文件"));
     }
     // The release asset must actually carry the version the tag promises. A
     // release built before its version bump would otherwise be installed over
     // and over, each start offering the same update again (#26).
     if !carries_version(&head, &av.version) {
         let _ = std::fs::remove_file(&fresh);
-        bail!(
-            "the {} download does not identify itself as {}: the release asset is not the              version its tag claims. Nothing was changed; please report it on the issue tracker.",
+        bail!("{}", crate::trfmt!("the {} download does not identify itself as {}: the release asset is not the              version its tag claims. Nothing was changed; please report it on the issue tracker.", "{} 的下载内容没有表明自己是 {}：该发布资源不是其标签声称的版本。未做任何改动；请在 issue 跟踪器中报告。",
             av.tag,
             av.version
-        );
+        ));
     }
     let old = dir.join("dlss5oneclick.exe.old");
     let _ = std::fs::remove_file(&old);
@@ -117,7 +117,7 @@ pub fn download_and_swap(av: &Available, progress: &(dyn Fn(u8, &str) + Sync)) -
         let _ = std::fs::rename(&old, &me);
         return Err(e).context("cannot move the new exe into place");
     }
-    progress(100, "Updated; restarting");
+    progress(100, lang::tr("Updated; restarting", "已更新；正在重启"));
     Ok(me)
 }
 

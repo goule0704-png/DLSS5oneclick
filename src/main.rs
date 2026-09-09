@@ -7,6 +7,7 @@ mod gpu;
 mod gpupref;
 mod gui;
 mod installer;
+mod lang;
 mod library;
 mod logo;
 mod net;
@@ -43,7 +44,7 @@ fn main() {
     if args.first().map(String::as_str) == Some("--fetch") {
         attach_parent_console();
         let (Some(url), Some(dest)) = (args.get(1), args.get(2)) else {
-            eprintln!("usage: --fetch <url> <file>");
+            eprintln!("{}", crate::trfmt!("usage: --fetch <url> <file>", "用法：--fetch <url> <file>"));
             std::process::exit(2);
         };
         let code = match net::client().and_then(|c| {
@@ -121,19 +122,19 @@ error: {e:#}"
     if args.iter().any(|a| a == "--imports") {
         attach_parent_console();
         let Some(first) = args.first().filter(|a| !a.starts_with('-')) else {
-            eprintln!("error: --imports needs a game exe or folder");
+            eprintln!("{}", crate::trfmt!("error: --imports needs a game exe or folder", "错误：--imports 需要游戏 exe 或文件夹"));
             std::process::exit(1);
         };
         match game::resolve_target(&PathBuf::from(first)) {
             Ok((exe, _)) => {
                 println!("{}", exe.display());
-                println!("  api read as: {}", game::detect_api(&exe).label());
+                println!("{}", crate::trfmt!("  api read as: {}", "  识别到的 api：{}", game::detect_api(&exe).label()));
                 let imports = game::pe_imports(&exe);
-                println!("  imports: {}", imports.join(", "));
+                println!("{}", crate::trfmt!("  imports: {}", "  导入：{}", imports.join(", ")));
                 for dll in ["d3d9.dll", "d3d11.dll", "d3d12.dll", "dxgi.dll"] {
                     let fns = game::pe_import_fns(&exe, dll);
                     if !fns.is_empty() {
-                        println!("  from {dll}: {}", fns.join(", "));
+                        println!("{}", crate::trfmt!("  from {dll}: {}", "  来自 {dll}：{}", fns.join(", ")));
                     }
                 }
                 std::process::exit(0);
@@ -150,7 +151,7 @@ error: {e:#}"
     if let Some(m) = args.iter().find_map(|a| a.strip_prefix("--mode=")) {
         std::env::set_var(game::MODE_ENV, m);
         if game::mode_override().is_none() {
-            eprintln!("error: --mode must be feeder or native");
+            eprintln!("{}", crate::trfmt!("error: --mode must be feeder or native", "错误：--mode 必须是 feeder 或 native"));
             std::process::exit(1);
         }
     }
@@ -177,15 +178,14 @@ error: {e:#}"
     if let Err(e) = gui::run() {
         // The release build has no console: say it in a box and leave a file (#23).
         let msg = format!("{e:#}");
-        eprintln!("gui error: {msg}");
+        eprintln!("{}", crate::trfmt!("gui error: {msg}", "GUI 错误：{msg}"));
         let log = write_error_log(&msg);
-        report_gui_error(&format!(
-            "DLSS5oneclick could not open its window.
+        report_gui_error(&crate::trfmt!("DLSS5oneclick could not open its window.
 
 {msg}
 
 Written to {}
-Attach that file to a GitHub issue.",
+Attach that file to a GitHub issue.", "DLSS5oneclick 无法打开窗口。\n\n{msg}\n\n已写入 {}\n请将该文件附到 GitHub issue。",
             log.display()
         ));
         std::process::exit(2);
@@ -195,22 +195,21 @@ Attach that file to a GitHub issue.",
 fn cli_update() -> i32 {
     match update::check() {
         Ok(None) => {
-            println!("DLSS5oneclick {} is the latest version.", update::CURRENT);
+            println!("{}", crate::trfmt!("DLSS5oneclick {} is the latest version.", "DLSS5oneclick {} 已是最新版本。", update::CURRENT));
             0
         }
         Ok(Some(av)) => {
-            println!(
-                "{} -> {} available. Downloading...",
+            println!("{}", crate::trfmt!("{} -> {} available. Downloading...", "{} -> {} 可用。正在下载…",
                 update::CURRENT,
                 av.version
-            );
+            ));
             let progress = |pct: u8, msg: &str| {
                 print!("\r{pct:3}% {msg:<72}");
                 let _ = std::io::stdout().flush();
             };
             match update::download_and_swap(&av, &progress) {
                 Ok(exe) => {
-                    println!("\nUpdated to {} at {}", av.version, exe.display());
+                    println!("{}", crate::trfmt!("\nUpdated to {} at {}", "\n已更新到 {}，位于 {}", av.version, exe.display()));
                     0
                 }
                 Err(e) => {
@@ -263,22 +262,21 @@ fn cli(
                     .into_owned()
             })
             .collect();
-        println!(
-            "using {} (other candidates: {})",
+        println!("{}", crate::trfmt!("using {} (other candidates: {})", "使用 {}（其它候选：{}）",
             exe.display(),
             others.join(", ")
-        );
+        ));
     } else if !candidates.is_empty() {
-        println!("using {}", exe.display());
+        println!("{}", crate::trfmt!("using {}", "使用 {}", exe.display()));
     }
     if diagnose_only {
         return match diagnose::run(&exe) {
             Ok(findings) => {
                 for f in &findings {
                     let tag = match f.level {
-                        diagnose::Level::Ok => "ok  ",
-                        diagnose::Level::Warn => "warn",
-                        diagnose::Level::Bad => "FAIL",
+                        diagnose::Level::Ok => lang::tr("ok  ", "正常"),
+                        diagnose::Level::Warn => lang::tr("warn", "警告"),
+                        diagnose::Level::Bad => lang::tr("FAIL", "失败"),
                     };
                     println!("[{tag}] {}", text::tidy(&f.text));
                 }
@@ -311,28 +309,27 @@ fn cli(
                 }
                 let names: Vec<&str> = installer::plan_with(&st, engine, with_renodx, upstream)
                     .iter()
-                    .map(|s| s.name)
+                    .map(|s| lang::tr(s.name, s.name_zh))
                     .collect();
                 println!("  plan: {}", names.join(" -> "));
                 if st.re_engine {
                     println!(
                         "  RE Engine game: REFramework (dinput8.dll) {}",
                         if st.reframework {
-                            "present"
+                            lang::tr("present", "已存在")
                         } else {
-                            "missing, will be installed"
+                            lang::tr("missing, will be installed", "缺失，将被安装")
                         }
                     );
                 }
                 if gpupref::hybrid() {
                     // Which GPU Windows starts the process on decides whether NGX
                     // exists in it at all (#25).
-                    println!(
-                        "  hybrid machine ({}) · Windows GPU preference for {}: {}",
+                    println!("{}", crate::trfmt!("  hybrid machine ({}) · Windows GPU preference for {}: {}", "  混合机器（{}）· {} 的 Windows GPU 偏好：{}",
                         gpupref::real_adapters().join(", "),
                         exe.file_name().unwrap_or_default().to_string_lossy(),
-                        gpupref::get(&exe).unwrap_or_else(|| "not set".into())
-                    );
+                        gpupref::get(&exe).unwrap_or_else(|| lang::tr("not set", "未设置").into())
+                    ));
                 }
                 if game::installed_by_tool(st.game_dir()) {
                     // Same comparison the Games page makes, so a stale install
@@ -341,9 +338,9 @@ fn cli(
                         .map(|c| installer::Latest::fetch(&c))
                         .unwrap_or_default();
                     match installer::stale_components(st.game_dir(), &latest).as_slice() {
-                        [] => println!("  installed by this tool · everything current"),
+                        [] => println!("{}", crate::trfmt!("  installed by this tool · everything current", "  由本工具安装 · 全部为最新")),
                         stale => {
-                            println!("  installed by this tool · out of date:");
+                            println!("{}", crate::trfmt!("  installed by this tool · out of date:", "  由本工具安装 · 已过时："));
                             for s in stale {
                                 println!("    {s}");
                             }
@@ -351,17 +348,15 @@ fn cli(
                     }
                 }
                 if let Some(m) = &st.renodx_mod {
-                    println!("  RenoDX mod installed: {m}");
+                    println!("{}", crate::trfmt!("  RenoDX mod installed: {m}", "  已安装 RenoDX 模组：{m}"));
                 }
                 if !st.foreign_renodx.is_empty() {
-                    println!(
-                        "  RenoDX mod present (not installed by this tool): {}",
+                    println!("{}", crate::trfmt!("  RenoDX mod present (not installed by this tool): {}", "  存在 RenoDX 模组（非本工具安装）：{}",
                         st.foreign_renodx.join(", ")
-                    );
+                    ));
                 }
                 match net::client().and_then(|c| renodx::lookup(&c, &exe)) {
-                    Ok(Some(m)) => println!(
-                        "  RenoDX HDR mod available: {} -> {} ({}){}",
+                    Ok(Some(m)) => println!("{}", crate::trfmt!("  RenoDX HDR mod available: {} -> {} ({}){}", "  可用的 RenoDX HDR 模组：{} -> {}（{}）{}",
                         m.title,
                         m.file,
                         m.status_label(),
@@ -370,9 +365,9 @@ fn cli(
                         } else {
                             format!(" | {}", m.note)
                         }
-                    ),
-                    Ok(None) => println!("  RenoDX HDR mod: none for this game"),
-                    Err(e) => println!("  RenoDX lookup failed: {e:#}"),
+                    )),
+                    Ok(None) => println!("{}", crate::trfmt!("  RenoDX HDR mod: none for this game", "  RenoDX HDR 模组：此游戏没有")),
+                    Err(e) => println!("{}", crate::trfmt!("  RenoDX lookup failed: {e:#}", "  RenoDX 查询失败：{e:#}")),
                 }
                 0
             }
@@ -386,7 +381,7 @@ fn cli(
         return match installer::uninstall_all(&exe) {
             Ok((list, kept)) => {
                 for f in list {
-                    println!("removed {f}");
+                    println!("{}", crate::trfmt!("removed {f}", "已移除 {f}"));
                 }
                 if let Some(k) = kept {
                     println!("{k}");
@@ -403,7 +398,7 @@ fn cli(
         return match installer::uninstall(&exe) {
             Ok(list) => {
                 for f in list {
-                    println!("removed {f}");
+                    println!("{}", crate::trfmt!("removed {f}", "已移除 {f}"));
                 }
                 0
             }
@@ -441,12 +436,20 @@ fn cli(
         Ok(_) => {
             if engine == installer::Engine::Opti {
                 println!(
-                    "
-Done. In game: Insert opens the OptiScaler overlay -> enable Neural Rendering (off by default)."
+                    "{}",
+                    crate::trfmt!(
+                        "\nDone. In game: Insert opens the OptiScaler overlay -> enable Neural Rendering (off by default).",
+                        "\n完成。游戏中：按 Insert 打开 OptiScaler 覆盖层 -> 启用神经渲染（默认关闭）。",
+                    )
                 );
             } else {
-                println!("
-Done. In game: Home opens ReShade -> Add-ons tab -> DLSS 5 Neural Rendering -> enable. (Home tab saying no effect files is normal on games with their own DLSS.)");
+                println!(
+                    "{}",
+                    crate::trfmt!(
+                        "\nDone. In game: Home opens ReShade -> Add-ons tab -> DLSS 5 Neural Rendering -> enable. (Home tab saying no effect files is normal on games with their own DLSS.)",
+                        "\n完成。游戏中：按 Home 打开 ReShade -> Add-ons 标签页 -> DLSS 5 Neural Rendering -> 启用。（自带 DLSS 的游戏 Home 标签页提示无效果文件是正常的。）",
+                    )
+                );
             }
             0
         }
@@ -492,7 +495,7 @@ fn install_panic_handler() {
         let where_ = info
             .location()
             .map(|l| format!("{}:{}", l.file(), l.line()))
-            .unwrap_or_else(|| "unknown location".into());
+            .unwrap_or_else(|| lang::tr("unknown location", "未知位置").into());
         let what = info
             .payload()
             .downcast_ref::<&str>()
@@ -502,13 +505,12 @@ fn install_panic_handler() {
         let msg = format!("panic at {where_}: {what}");
         eprintln!("{msg}");
         let log = write_error_log(&msg);
-        report_gui_error(&format!(
-            "DLSS5oneclick stopped unexpectedly.
+        report_gui_error(&crate::trfmt!("DLSS5oneclick stopped unexpectedly.
 
 {msg}
 
 Written to {}
-Attach that file to a GitHub issue.",
+Attach that file to a GitHub issue.", "DLSS5oneclick 意外停止。\n\n{msg}\n\n已写入 {}\n请将该文件附到 GitHub issue。",
             log.display()
         ));
     }));

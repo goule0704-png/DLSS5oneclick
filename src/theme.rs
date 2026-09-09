@@ -77,6 +77,11 @@ pub fn install(ctx: &egui::Context) {
         "jbmono",
         include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"),
     );
+    add(
+        &mut fonts,
+        "noto-sc",
+        include_bytes!("../assets/fonts/NotoSansSC-Regular.ttf"),
+    );
 
     fonts
         .families
@@ -85,9 +90,19 @@ pub fn install(ctx: &egui::Context) {
         .insert(0, "plex".to_owned());
     fonts
         .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .push("noto-sc".to_owned());
+    fonts
+        .families
         .entry(FontFamily::Monospace)
         .or_default()
         .insert(0, "jbmono".to_owned());
+    fonts
+        .families
+        .entry(FontFamily::Monospace)
+        .or_default()
+        .push("noto-sc".to_owned());
     for name in [SORA, PLEX_MEDIUM, PLEX_SEMIBOLD] {
         // Fall back to the regular proportional chain for glyphs the face lacks.
         let mut chain = vec![name.to_owned()];

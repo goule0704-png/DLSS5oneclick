@@ -14,6 +14,7 @@
 //!   ShellVisuals DefaultDisplayName / Square150x150Logo / StoreLogo).
 //!
 //! Install date = the game folder's creation time (every store, one rule).
+use crate::lang;
 
 use regex::Regex;
 use serde_json::Value;
@@ -38,7 +39,7 @@ impl Store {
             Store::Epic => "Epic Games",
             Store::Gog => "GOG",
             Store::Xbox => "Xbox",
-            Store::Manual => "Added by you",
+            Store::Manual => lang::tr("Added by you", "手动添加"),
         }
     }
 }

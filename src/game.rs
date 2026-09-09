@@ -1,6 +1,7 @@
 //! Game-folder inspection: exe bitness, ReShade presence, installed pieces.
 
 use crate::gpu;
+use crate::lang;
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -144,7 +145,7 @@ impl Api {
             Api::Dx11 => "DX11",
             Api::Dx12 => "DX12",
             Api::Vulkan => "Vulkan",
-            Api::Unknown => "API unknown, assuming DX12",
+            Api::Unknown => lang::tr("API unknown, assuming DX12", "无法识别 API，按 DX12 处理"),
         }
     }
 }
@@ -558,7 +559,7 @@ pub fn known_anticheat_exe(exe: &Path) -> Option<&'static str> {
         .unwrap_or("")
         .to_ascii_lowercase();
     match n.as_str() {
-        "overwatch.exe" => Some("Blizzard anti-cheat (Overwatch)"),
+        "overwatch.exe" => Some(lang::tr("Blizzard anti-cheat (Overwatch)", "暴雪反作弊（Overwatch）")),
         "valorant.exe" | "valorant-win64-shipping.exe" => Some("Riot Vanguard"),
         "leagueclient.exe" | "league of legends.exe" => Some("Riot Vanguard"),
         _ => None,
@@ -879,11 +880,11 @@ impl GameStatus {
     /// Indiana Jones and the Great Circle, which worked until 0.11.8).
     pub fn reshade_engine_problem(&self) -> Option<String> {
         (self.api == Api::Vulkan).then(|| {
-            "This is a Vulkan game, so the ReShade engine cannot reach it: ReShade hooks \
+            lang::tr("This is a Vulkan game, so the ReShade engine cannot reach it: ReShade hooks \
              Vulkan through a registered layer, not through the dxgi.dll installed beside \
              the exe, and nothing here would ever load. Use the OptiScaler engine, which \
              does cover Vulkan. To use ReShade anyway, run its own setup, point it at this \
-             exe and choose Vulkan, then follow DLSS5-Feeder's Vulkan instructions."
+             exe and choose Vulkan, then follow DLSS5-Feeder's Vulkan instructions.", "这是一个 Vulkan 游戏，因此 ReShade 引擎无法接入：ReShade 是通过已注册的图层挂钩 Vulkan，而不是通过安装在 exe 旁的 dxgi.dll，所以这里安装的任何东西都不会被加载。请改用能覆盖 Vulkan 的 OptiScaler 引擎。若仍想用 ReShade，请运行它自带的安装程序，指向这个 exe 并选择 Vulkan，然后按 DLSS5-Feeder 的 Vulkan 说明操作。")
                 .to_owned()
         })
     }
@@ -934,7 +935,7 @@ impl GameStatus {
 
 pub fn inspect(exe: &Path) -> Result<GameStatus> {
     if !exe.is_file() {
-        bail!("game executable not found: {}", exe.display());
+        bail!("{}", crate::trfmt!("game executable not found: {}", "游戏可执行文件未找到：{}", exe.display()));
     }
     let d = exe.parent().context("exe has no parent directory")?;
     let bitness = exe_bitness(exe)?;
@@ -944,8 +945,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     let anticheat = detect_anticheat(d).or_else(|| known_anticheat_exe(exe));
     if let Some(ac) = anticheat {
         if !ignore_anticheat() {
-            problems.push(format!(
-                "{ac} anti-cheat found in this game. ReShade add-on injection is what it detects: kick at best, ban at worst. Refused."
+            problems.push(crate::trfmt!("{ac} anti-cheat found in this game. ReShade add-on injection is what it detects: kick at best, ban at worst. Refused.", "检测到 {ac} 反作弊。ReShade 附加组件注入正是它要检测的行为：轻则踢出，重则封禁。已拒绝。"
             ));
         }
     }
@@ -953,9 +953,8 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     let skip_gpu = skip_gpu_check();
     if let Some((g, t)) = &gpu {
         if !t.can_run() && !skip_gpu {
-            problems.push(format!(
-                "GPU is {} ({}): the DLSS 5 model runs on NVIDIA RTX only (it needs tensor cores and NGX). \
-                 Misdetected, or running through Remote Desktop? Tick the box below, or set {}=1.",
+            problems.push(crate::trfmt!("GPU is {} ({}): the DLSS 5 model runs on NVIDIA RTX only (it needs tensor cores and NGX). \
+                 Misdetected, or running through Remote Desktop? Tick the box below, or set {}=1.", "GPU 为 {}（{}）：DLSS 5 模型仅在 NVIDIA RTX 上运行（需要张量核心和 NGX）。识别有误，或正通过远程桌面运行？勾选下方复选框，或设置 {}=1。",
                 g.name,
                 t.label(),
                 SKIP_GPU_CHECK_ENV
@@ -967,7 +966,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     // Feeder (verified working on Dead or Alive 5 Last Round, #17).
     if d.join("d3d9.dll").is_file() && !d.join(RESHADE_PROXY).is_file() && !is_dgvoodoo(d) {
         problems.push(
-            "A d3d9.dll proxy is present that is not dgVoodoo2. DirectX 9 itself is not a dead              end -- DLSS 5 needs a D3D11/12 device, and dgVoodoo2 provides one, which is how a              D3D9 game can work here (#17, #37) -- but this tool cannot install behind another              wrapper. Replace it with dgVoodoo 2.87.3 (MS\\x86 or MS\\x64\\D3D9.dll plus              dgVoodoo.conf, OutputAPI = d3d11_fl11_0, VRAM >= 4096) and run Install again."
+            lang::tr("A d3d9.dll proxy is present that is not dgVoodoo2. DirectX 9 itself is not a dead              end -- DLSS 5 needs a D3D11/12 device, and dgVoodoo2 provides one, which is how a              D3D9 game can work here (#17, #37) -- but this tool cannot install behind another              wrapper. Replace it with dgVoodoo 2.87.3 (MS\\x86 or MS\\x64\\D3D9.dll plus              dgVoodoo.conf, OutputAPI = d3d11_fl11_0, VRAM >= 4096) and run Install again.", "存在一个非 dgVoodoo2 的 d3d9.dll 代理。DirectX 9 本身并非绝路 —— DLSS 5 需要 D3D11/12 设备，而 dgVoodoo2 正好提供这一点，这也是 D3D9 游戏能在此运行的方式（#17、#37）—— 但本工具无法在其它包装器之后安装。请换成 dgVoodoo 2.87.3（MS\\x86 或 MS\\x64\\D3D9.dll 加上 dgVoodoo.conf，OutputAPI = d3d11_fl11_0，VRAM >= 4096）后重新安装。")
                 .into(),
         );
     }
@@ -978,7 +977,7 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
     let is32 = bitness == 32;
     if is32 && api == Api::Dx12 {
         problems.push(
-            "32-bit game on Direct3D 12: DLSS5-Feeder's 32-bit add-on covers Direct3D 9 (through dgVoodoo2), 10 and 11, but not 12."
+            lang::tr("32-bit game on Direct3D 12: DLSS5-Feeder's 32-bit add-on covers Direct3D 9 (through dgVoodoo2), 10 and 11, but not 12.", "32 位游戏运行于 Direct3D 12：DLSS5-Feeder 的 32 位附加组件支持 Direct3D 9（经 dgVoodoo2）、10 和 11，但不支持 12。")
                 .into(),
         );
     }
@@ -1213,10 +1212,10 @@ pub fn resolve_target(input: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
         let c = find_game_exes(input);
         return match c.first() {
             Some(first) => Ok((first.clone(), c)),
-            None => bail!("no 64-bit game executable found in {}", input.display()),
+            None => bail!("{}", crate::trfmt!("no 64-bit game executable found in {}", "在 {} 中未找到 64 位游戏可执行文件", input.display())),
         };
     }
-    bail!("not found: {}", input.display())
+    bail!("{}", crate::trfmt!("not found: {}", "未找到：{}", input.display()))
 }
 
 /// True when ReShade/Feeder markers sit on a launcher folder but the preferred
@@ -1232,8 +1231,7 @@ pub fn install_folder_mismatch(preferred_exe: &Path) -> Option<String> {
     for _ in 0..4 {
         let Some(d) = cur else { break };
         if (d.join(RESHADE_PROXY).is_file() || d.join(FEEDER_MARKER).is_file()) && d != ship_dir {
-            return Some(format!(
-                "ReShade/Feeder found in {} but not next to {} — Install on the Shipping exe",
+            return Some(crate::trfmt!("ReShade/Feeder found in {} but not next to {} — Install on the Shipping exe", "在 {} 中发现了 ReShade/Feeder，但不在 {} 旁 —— 请对 Shipping exe 安装",
                 d.display(),
                 preferred_exe
                     .file_name()

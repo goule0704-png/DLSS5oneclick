@@ -5,6 +5,7 @@
 //! Feeder auto-profile then retunes reset / lightstab / OFA once from observed game data.
 
 use crate::game::{Api, GameStatus, Mode};
+use crate::lang;
 use crate::gpu::{self, Tier};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,10 +19,10 @@ pub enum QualityChoice {
 impl QualityChoice {
     pub fn label(self) -> &'static str {
         match self {
-            QualityChoice::Auto => "Auto",
-            QualityChoice::Low => "Low",
-            QualityChoice::Medium => "Medium",
-            QualityChoice::High => "High",
+            QualityChoice::Auto => lang::tr("Auto", "自动"),
+            QualityChoice::Low => lang::tr("Low", "低"),
+            QualityChoice::Medium => lang::tr("Medium", "中"),
+            QualityChoice::High => lang::tr("High", "高"),
         }
     }
 
@@ -125,7 +126,7 @@ fn base_low() -> ResolvedQuality {
         lighting_strength: 1.0,
         detail_threshold: 0.028,
         detail_strength: 1.0,
-        summary: "Low: Lumenite MV, softer masks, work 70% + FSR expand".into(),
+        summary: lang::tr("Low: Lumenite MV, softer masks, work 70% + FSR expand", "低：Lumenite MV、较柔和蒙版、工作分辨率 70% + FSR 扩展").into(),
     }
 }
 
@@ -150,7 +151,7 @@ fn base_medium() -> ResolvedQuality {
         lighting_strength: 1.35,
         detail_threshold: 0.018,
         detail_strength: 1.40,
-        summary: "Medium: engine velocity hunt + Lumenite fallback, residual masks, work 85% + FSR"
+        summary: lang::tr("Medium: engine velocity hunt + Lumenite fallback, residual masks, work 85% + FSR", "中：引擎速度追踪 + Lumenite 回退、残差蒙版、工作分辨率 85% + FSR")
             .into(),
     }
 }
@@ -181,7 +182,7 @@ fn base_high() -> ResolvedQuality {
         lighting_strength: 1.50,
         detail_threshold: 0.012,
         detail_strength: 1.55,
-        summary: "High: engine velocity + Optical Flow fallback, stronger masks, full resolution"
+        summary: lang::tr("High: engine velocity + Optical Flow fallback, stronger masks, full resolution", "高：引擎速度 + 光流回退、更强蒙版、完整分辨率")
             .into(),
     }
 }
@@ -264,7 +265,7 @@ pub fn resolve(
                 a.lighting_threshold = 0.035;
                 a.detail_threshold = 0.015;
                 a.summary =
-                    "Auto: engine velocity + Optical Flow + residual masks (Feeder D3D11 + RTX) — recommendation only"
+                    lang::tr("Auto: engine velocity + Optical Flow + residual masks (Feeder D3D11 + RTX) — recommendation only", "自动：引擎速度 + 光流 + 残差蒙版（Feeder D3D11 + RTX）—— 仅供参考")
                         .into();
                 a
             } else if matches!(st.api, Api::Dx12) {
@@ -275,7 +276,7 @@ pub fn resolve(
                 a.engine_velocity = true;
                 a.work_resolution = 100;
                 a.summary =
-                    "Auto: DX12 Feeder (no OFA) — Lumenite MV + velocity hunt; Optimize uses half-rate cost first"
+                    lang::tr("Auto: DX12 Feeder (no OFA) — Lumenite MV + velocity hunt; Optimize uses half-rate cost first", "自动：DX12 Feeder（无 OFA）—— Lumenite MV + 速度追踪；Optimize 先用半速率开销")
                         .into();
                 a
             } else {
@@ -283,7 +284,7 @@ pub fn resolve(
                 a.choice = QualityChoice::Auto;
                 a.engine_velocity = true;
                 a.summary =
-                    "Auto: Medium + engine velocity hunt (Optical Flow not applicable) — recommendation only"
+                    lang::tr("Auto: Medium + engine velocity hunt (Optical Flow not applicable) — recommendation only", "自动：中 + 引擎速度追踪（光流不适用）—— 仅供参考")
                         .into();
                 a
             }

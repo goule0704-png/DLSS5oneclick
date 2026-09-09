@@ -13,6 +13,7 @@
 //! (same NAME, same keys) — so exactly one per folder.
 
 use crate::net;
+use crate::lang;
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
 use reqwest::blocking::Client;
@@ -42,9 +43,9 @@ pub struct Mod {
 impl Mod {
     pub fn status_label(&self) -> &'static str {
         match self.status {
-            "stable" => "working",
-            "wip" => "in progress — may have issues",
-            _ => "status unknown",
+            "stable" => lang::tr("working", "正常"),
+            "wip" => lang::tr("in progress — may have issues", "开发中 — 可能有异常"),
+            _ => lang::tr("status unknown", "状态未知"),
         }
     }
 }
@@ -301,27 +302,25 @@ pub fn install(
 ) -> Result<Vec<String>> {
     let dir = exe.parent().context("exe has no parent")?;
     let url = m.url.as_deref().ok_or_else(|| {
-        anyhow!(
-            "the RenoDX mod for {} is only published on Nexus Mods / Discord; download it by hand and drop the .addon64 next to the game exe",
+        anyhow!("{}", crate::trfmt!("the RenoDX mod for {} is only published on Nexus Mods / Discord; download it by hand and drop the .addon64 next to the game exe", "{} 的 RenoDX 模组仅在 Nexus Mods / Discord 发布；请手动下载并把 .addon64 放到游戏 exe 旁",
             m.title
-        )
+        ))
     })?;
     let foreign = foreign_mods(dir, Some(&m.file));
     if !foreign.is_empty() {
-        anyhow::bail!(
-            "this game already has a RenoDX mod ({}); ReShade loads only one \"RenoDX\" add-on and two would fight over the same settings. Remove it first.",
+        anyhow::bail!("{}", crate::trfmt!("this game already has a RenoDX mod ({}); ReShade loads only one \"RenoDX\" add-on and two would fight over the same settings. Remove it first.", "此游戏已有一个 RenoDX 模组（{}）；ReShade 只加载一个 \"RenoDX\" 附加组件，两个会争抢同一组设置。请先移除它。",
             foreign.join(", ")
-        );
+        ));
     }
     let dest = dir.join(&m.file);
     if dest.is_file() {
-        progress(100, "RenoDX mod already installed");
+        progress(100, lang::tr("RenoDX mod already installed", "RenoDX 模组已安装"));
     } else {
         net::download(
             client,
             url,
             &dest,
-            &format!("RenoDX: {}", m.title),
+            &crate::trfmt!("RenoDX: {}", "RenoDX：{}", m.title),
             progress,
         )?;
     }

@@ -5,6 +5,7 @@ use crate::diagnose;
 use crate::feeder_cfg::{self, FeederKnobs};
 use crate::game::{self, GameStatus};
 use crate::installer::{self, Engine, StepState};
+use crate::lang;
 use crate::library::{self, Game, Store};
 use crate::logo;
 use crate::net;
@@ -69,7 +70,7 @@ pub struct App {
     updating: Option<usize>,
     /// One refreshed card, after its install finished.
     meta_one_rx: Option<Receiver<(usize, GameMeta)>>,
-    /// The user pressed "Check for updates": the answer is worth showing even
+    /// The user pressed lang::tr("Check for updates", "检查更新"): the answer is worth showing even
     /// when it is "nothing new", which a background check never says.
     checked_manually: bool,
     /// When the last update check ran. The check used to happen once, at
@@ -99,6 +100,8 @@ pub struct App {
     /// Exe the current lookup belongs to, so a refresh does not re-fetch.
     renodx_for: Option<PathBuf>,
     page: Page,
+    /// UI language, persisted so the choice survives restarts.
+    lang: lang::Lang,
     games: Vec<Game>,
     scanning: bool,
     scan_rx: Option<Receiver<Vec<Game>>>,
@@ -181,7 +184,7 @@ fn meta_from_status(st: &GameStatus, latest: &installer::Latest) -> GameMeta {
             game::Api::Dx10 => "DirectX 10",
             game::Api::Dx11 => "DirectX 11",
             game::Api::Dx12 => "DirectX 12",
-            game::Api::Unknown => "DirectX 12?",
+            game::Api::Unknown => lang::tr("DirectX 12?", "DirectX 12？"),
         },
         has_dlss: st.mode == game::Mode::Native,
         engine_path: if st.opti {
@@ -222,6 +225,16 @@ impl App {
             .storage
             .and_then(|s| s.get_string("exe"))
             .unwrap_or_default();
+        let lang_val = cc
+            .storage
+            .and_then(|s| s.get_string("lang"))
+            .and_then(|s| match s.as_str() {
+                "zh" => Some(lang::Lang::Zh),
+                "en" => Some(lang::Lang::En),
+                _ => None,
+            })
+            .unwrap_or_else(lang::system_default);
+        lang::set(lang_val);
         let mut app = App {
             exe_text,
             status: None,
@@ -247,6 +260,7 @@ impl App {
             renodx_rx: None,
             renodx_for: None,
             page: Page::Games,
+            lang: lang_val,
             games: Vec::new(),
             scanning: false,
             scan_rx: None,
@@ -383,7 +397,7 @@ impl App {
                 self.knobs_err = None;
                 self.knobs_dirty = false;
                 self.log
-                    .push(LogLine::Ok("Applied Settings defaults to this game".into()));
+                    .push(LogLine::Ok(lang::tr("Applied Settings defaults to this game", "已把设置默认值应用到当前游戏").into()));
             }
             Err(e) => self.knobs_err = Some(format!("{e:#}")),
         }
@@ -460,10 +474,9 @@ impl App {
                     installer::uninstall(&exe)
                 };
                 res.map(|r| {
-                    format!(
-                        "Removed: {}",
+                    crate::trfmt!("Removed: {}", "已移除：{}",
                         if r.is_empty() {
-                            "nothing".into()
+                            lang::tr("nothing", "无").into()
                         } else {
                             r.join(", ")
                         }
@@ -484,17 +497,17 @@ impl App {
                     &move |i, n, name, state, detail| {
                         let line = match state {
                             StepState::Start => LogLine::Step(format!("[{}/{n}] {name}", i + 1)),
-                            StepState::Done => LogLine::Ok(format!("ok: {detail}")),
-                            StepState::Error => LogLine::Fail(format!("FAILED: {detail}")),
+                            StepState::Done => LogLine::Ok(crate::trfmt!("ok: {}", "成功：{}", detail)),
+                            StepState::Error => LogLine::Fail(crate::trfmt!("FAILED: {}", "失败：{}", detail)),
                         };
                         let _ = s_tx.send(Msg::Log(line));
                     },
                 )
                 .map(|_| {
                     if engine == Engine::Opti {
-                        "Done. In game: Insert opens the OptiScaler overlay → enable Neural Rendering.".to_owned()
+                        lang::tr("Done. In game: Insert opens the OptiScaler overlay → enable Neural Rendering.", "完成。游戏中：按 Insert 打开 OptiScaler 覆盖层 → 启用神经渲染（默认关闭）。").to_owned()
                     } else {
-                        "Done. In game: Home opens ReShade → Add-ons tab → DLSS 5 Neural Rendering → enable. (Home tab saying \"no effect files\" is normal on games with their own DLSS.)".to_owned()
+                        lang::tr("Done. In game: Home opens ReShade → Add-ons tab → DLSS 5 Neural Rendering → enable. (Home tab saying \"no effect files\" is normal on games with their own DLSS.)", "完成。游戏中：按 Home 打开 ReShade → Add-ons 标签页 → DLSS 5 Neural Rendering → 启用。（自带 DLSS 的游戏在 Home 标签页提示「无效果文件」是正常的。）").to_owned()
                     }
                 })
                 .map_err(|e| format!("{e:#}"))
@@ -706,7 +719,7 @@ impl App {
     fn start_update_download(&mut self, av: update::Available) {
         let (tx, rx) = channel::<UpdateState>();
         self.update_rx = Some(rx);
-        self.update = UpdateState::Downloading(0, "Starting".into());
+        self.update = UpdateState::Downloading(0, lang::tr("Starting", "开始").into());
         thread::spawn(move || {
             let p_tx = tx.clone();
             let res = update::download_and_swap(&av, &move |pct, msg| {
@@ -737,10 +750,10 @@ impl App {
                     let line = match f.level {
                         diagnose::Level::Ok => LogLine::Ok(format!("ok: {}", text::tidy(&f.text))),
                         diagnose::Level::Warn => {
-                            LogLine::Plain(format!("warn: {}", text::tidy(&f.text)))
+                            LogLine::Plain(crate::trfmt!("warn: {}", "警告：{}", text::tidy(&f.text)))
                         }
                         diagnose::Level::Bad => {
-                            LogLine::Fail(format!("FAIL: {}", text::tidy(&f.text)))
+                            LogLine::Fail(crate::trfmt!("FAIL: {}", "失败：{}", text::tidy(&f.text)))
                         }
                     };
                     self.log.push(line);
@@ -785,11 +798,11 @@ impl App {
             match r {
                 Ok(msg) => {
                     self.progress = 100;
-                    self.progress_msg = "Done.".into();
+                    self.progress_msg = lang::tr("Done.", "完成。").into();
                     self.log.push(LogLine::Plain(msg));
                 }
                 Err(e) => {
-                    self.progress_msg = "Failed.".into();
+                    self.progress_msg = lang::tr("Failed.", "失败。").into();
                     self.log.push(LogLine::Fail(e.clone()));
                     self.last_error = Some(e);
                 }
@@ -801,7 +814,9 @@ impl App {
 
 struct Tile {
     title: &'static str,
+    title_zh: &'static str,
     detail: &'static str,
+    detail_zh: &'static str,
     ok: fn(&GameStatus) -> bool,
     optional: bool,
 }
@@ -809,37 +824,49 @@ struct Tile {
 const TILES_FEEDER: [Tile; 6] = [
     Tile {
         title: "ReShade",
+        title_zh: "ReShade",
         detail: "add-on build · dxgi.dll",
+        detail_zh: "附加组件构建版 · dxgi.dll",
         ok: |s| s.reshade,
         optional: false,
     },
     Tile {
         title: "Shader headers",
+        title_zh: "着色器头文件",
         detail: "ReShade.fxh · ReShadeUI.fxh · DrawText.fxh",
+        detail_zh: "ReShade.fxh · ReShadeUI.fxh · DrawText.fxh",
         ok: |s| s.headers,
         optional: false,
     },
     Tile {
         title: "DLSS5-Feeder",
+        title_zh: "DLSS5-Feeder",
         detail: "dlss5-feed.addon64 · DLSS5_Feed.fx",
+        detail_zh: "dlss5-feed.addon64 · DLSS5_Feed.fx",
         ok: |s| s.feeder,
         optional: false,
     },
     Tile {
         title: "LumeniteFX",
+        title_zh: "LumeniteFX",
         detail: "motion vectors · Kernel 2.0",
+        detail_zh: "运动矢量 · Kernel 2.0",
         ok: |s| s.lumenite,
         optional: false,
     },
     Tile {
         title: "DLSS 5 add-on · leaked",
+        title_zh: "DLSS 5 附加组件 · 泄露版",
         detail: "renodx-dlss5.addon64 · nvngx_dlssnr.dll",
+        detail_zh: "renodx-dlss5.addon64 · nvngx_dlssnr.dll",
         ok: |s| s.dlss5_addon && s.dlssnr,
         optional: false,
     },
     Tile {
         title: "nvngx_dlss.dll",
+        title_zh: "nvngx_dlss.dll",
         detail: "DLSS runtime · the Feeder's NGX session needs it",
+        detail_zh: "DLSS 运行时 · Feeder 的 NGX 会话需要它",
         ok: |s| s.dlss,
         optional: false,
     },
@@ -848,24 +875,30 @@ const TILES_FEEDER: [Tile; 6] = [
 /// Same Feeder row as above, but the in-game half is addon32 on 32-bit titles.
 const TILE_FEEDER32: Tile = Tile {
     title: "DLSS5-Feeder",
+    title_zh: "DLSS5-Feeder",
     detail: "dlss5-feed.addon32 · DLSS5_Feed.fx (detail residual + Optical Flow)",
+    detail_zh: "dlss5-feed.addon32 · DLSS5_Feed.fx（细节残差 + 光流）",
     ok: |s| s.feeder,
     optional: false,
 };
 
 const TILE_OPTI: Tile = Tile {
     title: "OptiScaler + NR pass",
+    title_zh: "OptiScaler + NR 通道",
     detail: "Dagherbou fork as dxgi.dll · Insert opens its overlay",
+    detail_zh: "Dagherbou 分支版（dxgi.dll）· 按 Insert 打开覆盖层",
     ok: |s| s.opti,
     optional: false,
 };
 
 /// The OptiScaler route's neural consumer is built into OptiScaler itself, so
 /// it needs the model and nothing else. Showing the ReShade route's add-on row
-/// here left a finished install reporting "missing" (#66).
+/// here left a finished install reporting lang::tr("missing", "缺失") (#66).
 const TILE_OPTI_MODEL: Tile = Tile {
     title: "DLSS 5 model \u{00b7} leaked",
+    title_zh: "DLSS 5 模型 · 泄露版",
     detail: "nvngx_dlssnr.dll \u{00b7} OptiScaler's own NR pass consumes it",
+    detail_zh: "nvngx_dlssnr.dll · OptiScaler 自己的 NR 通道使用它",
     ok: |s| s.dlssnr,
     optional: false,
 };
@@ -873,25 +906,33 @@ const TILE_OPTI_MODEL: Tile = Tile {
 const TILES_NATIVE: [Tile; 4] = [
     Tile {
         title: "Game DLSS",
+        title_zh: "游戏 DLSS",
         detail: "nvngx_dlss.dll shipped by the game · add-on hooks it directly",
+        detail_zh: "游戏自带的 nvngx_dlss.dll · 附加组件直接挂钩",
         ok: |_| true,
         optional: false,
     },
     Tile {
         title: "ReShade",
+        title_zh: "ReShade",
         detail: "add-on build · dxgi.dll",
+        detail_zh: "附加组件构建版 · dxgi.dll",
         ok: |s| s.reshade,
         optional: false,
     },
     Tile {
         title: "DLSS 5 add-on · leaked",
+        title_zh: "DLSS 5 附加组件 · 泄露版",
         detail: "renodx-dlss5.addon64 · nvngx_dlssnr.dll",
+        detail_zh: "renodx-dlss5.addon64 · nvngx_dlssnr.dll",
         ok: |s| s.dlss5_addon && s.dlssnr,
         optional: false,
     },
     Tile {
         title: "DX11 bridge",
+        title_zh: "DX11 桥接",
         detail: "dlss5-bridge.addon64 (NIGos) · D3D11 games",
+        detail_zh: "dlss5-bridge.addon64 (NIGos) · D3D11 游戏",
         ok: |s| s.bridge,
         optional: true,
     },
@@ -899,28 +940,36 @@ const TILES_NATIVE: [Tile; 4] = [
 
 const TILE_UPSTREAM: Tile = Tile {
     title: "Neural Upstream \u{00b7} experimental",
+    title_zh: "神经上游 · 实验性",
     detail: "nvngx.dll.addon64 (matiasLombo) \u{00b7} nvngx_dlssnr.dll",
+    detail_zh: "nvngx.dll.addon64 (matiasLombo) \u{00b7} nvngx_dlssnr.dll",
     ok: |s| s.upstream && s.dlssnr,
     optional: false,
 };
 
 const TILE_HOST: Tile = Tile {
     title: "host64 helper (32-bit game)",
+    title_zh: "host64 助手（32 位游戏）",
     detail: "dlss5-feed-host64.exe + 64-bit ReShade · add-on and models live in host64\\",
+    detail_zh: "dlss5-feed-host64.exe + 64 位 ReShade · 附加组件与模型位于 host64\\",
     ok: |s| s.host_exe && s.host_reshade,
     optional: false,
 };
 
 const TILE_RENODX: Tile = Tile {
     title: "RenoDX HDR mod",
+    title_zh: "RenoDX HDR 模组",
     detail: "game-specific renodx-*.addon64 · Home → Add-ons → RenoDX",
+    detail_zh: "游戏专属 renodx-*.addon64 · Home → Add-ons → RenoDX",
     ok: |s| s.renodx_mod.is_some(),
     optional: true,
 };
 
 const TILE_REFRAMEWORK: Tile = Tile {
     title: "REFramework",
+    title_zh: "REFramework",
     detail: "dinput8.dll · RE Engine games need it before ReShade",
+    detail_zh: "dinput8.dll · RE 引擎游戏需在 ReShade 之前加载",
     ok: |s| s.reframework,
     optional: false,
 };
@@ -1031,11 +1080,11 @@ fn engine_card(
     // Right-hand pill: what clicking does. Makes the card read as a choice,
     // unlike the flat component list below it.
     let pill_text = if selected {
-        "SELECTED"
+        lang::tr("SELECTED", "已选择")
     } else if enabled {
-        "CHOOSE"
+        lang::tr("CHOOSE", "选择")
     } else {
-        "UNAVAILABLE"
+        lang::tr("UNAVAILABLE", "不可用")
     };
     let pill_font = t::plex_semibold(10.0);
     let galley = painter.layout_no_wrap(pill_text.to_owned(), pill_font, t::BG);
@@ -1137,23 +1186,23 @@ fn tile(ui: &mut egui::Ui, rect: egui::Rect, tl: &Tile, st: Option<&GameStatus>)
                     t::TEXT_OFF
                 };
                 ui.label(
-                    RichText::new(tl.title)
+                    RichText::new(lang::tr(tl.title, tl.title_zh))
                         .font(t::plex_medium(12.5))
                         .color(title_color),
                 );
                 ui.label(
-                    RichText::new(tl.detail)
+                    RichText::new(lang::tr(tl.detail, tl.detail_zh))
                         .font(t::plex(10.5))
                         .color(if dashed { t::TEXT_DIM } else { t::TEXT_MUTED }),
                 );
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let (text, color) = if ok {
-                    ("installed", t::ACCENT)
+                    (lang::tr("installed", "已安装"), t::ACCENT)
                 } else if dashed {
-                    ("not needed", t::TEXT_DIM)
+                    (lang::tr("not needed", "不需要"), t::TEXT_DIM)
                 } else {
-                    ("missing", t::TEXT_MUTED)
+                    (lang::tr("missing", "缺失"), t::TEXT_MUTED)
                 };
                 ui.label(RichText::new(text).font(t::plex(10.5)).color(color));
             });
@@ -1204,11 +1253,11 @@ impl App {
             .count();
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
-            ui.label(RichText::new("Games").font(t::sora(16.0)).color(t::TEXT));
+            ui.label(RichText::new(lang::tr("Games", "游戏")).font(t::sora(16.0)).color(t::TEXT));
             let summary = if self.scanning {
-                "scanning Steam, Epic, GOG and Xbox…".to_owned()
+                lang::tr("scanning Steam, Epic, GOG and Xbox…", "正在扫描 Steam、Epic、GOG 和 Xbox…").to_owned()
             } else {
-                format!("{} found · {dx12} on DirectX 12", self.games.len())
+                crate::trfmt!("{} found · {dx12} on DirectX 12", "找到 {} 个 · 其中 {dx12} 个为 DirectX 12", self.games.len())
             };
             ui.label(
                 RichText::new(summary)
@@ -1238,22 +1287,22 @@ impl App {
                 if ui
                     // Rescanning mid-install would renumber the cards under the
                     // one being worked on.
-                    .add_enabled(!self.scanning && !self.running, btn("Rescan", true))
+                    .add_enabled(!self.scanning && !self.running, btn(lang::tr("Rescan", "重新扫描"), true))
                     .clicked()
                 {
                     self.start_scan(ui.ctx());
                 }
-                if ui.add(btn("Add a folder", false)).clicked() {
+                if ui.add(btn(lang::tr("Add a folder", "添加文件夹"), false)).clicked() {
                     if let Some(p) = rfd::FileDialog::new()
-                        .set_title("Pick the game's install folder")
+                        .set_title(lang::tr("Pick the game's install folder", "选择游戏安装文件夹"))
                         .pick_folder()
                     {
                         self.add_game(p, ui.ctx());
                     }
                 }
-                if ui.add(btn("Add a game", false)).clicked() {
+                if ui.add(btn(lang::tr("Add a game", "添加游戏"), false)).clicked() {
                     if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("Executables", &["exe", "bin"])
+                        .add_filter(lang::tr("Executables", "可执行文件"), &["exe", "bin"])
                         .pick_file()
                     {
                         self.add_game(p, ui.ctx());
@@ -1261,7 +1310,7 @@ impl App {
                 }
                 let search = egui::TextEdit::singleline(&mut self.search)
                     .font(t::plex(12.0))
-                    .hint_text(RichText::new("Search").color(t::TEXT_DIM))
+                    .hint_text(RichText::new(lang::tr("Search", "搜索")).color(t::TEXT_DIM))
                     .desired_width(160.0);
                 ui.add(search);
             });
@@ -1284,7 +1333,7 @@ impl App {
                 let card_w =
                     ((avail - CARD_GAP * (cols as f32 - 1.0)) / cols as f32).clamp(CARD_W, 190.0);
                 let poster_h = (card_w * 1.5).round();
-                // None = "Installed by this tool", always first: the whole
+                // None = lang::tr("Installed by this tool", "由本工具安装"), always first: the whole
                 // point is to see at a glance what has been modified and
                 // what has fallen behind.
                 let sections: [Option<Store>; 6] = [
@@ -1328,7 +1377,7 @@ impl App {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         ui.label(
                             RichText::new(match section {
-                                None => "Installed by this tool",
+                                None => lang::tr("Installed by this tool", "由本工具安装"),
                                 Some(st) => st.label(),
                             })
                             .font(t::plex_semibold(13.0))
@@ -1342,13 +1391,13 @@ impl App {
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if stale > 0 {
                                 ui.label(
-                                    RichText::new(format!("{stale} need updating"))
+                                    RichText::new(crate::trfmt!("{stale} need updating", "{stale} 个需要更新"))
                                         .font(t::plex(11.5))
                                         .color(t::WARN),
                                 );
                             } else if ready > 0 {
                                 ui.label(
-                                    RichText::new(format!("{ready} ready for DLSS 5"))
+                                    RichText::new(crate::trfmt!("{ready} ready for DLSS 5", "{ready} 个已就绪，可用于 DLSS 5"))
                                         .font(t::plex(11.5))
                                         .color(t::ACCENT),
                                 );
@@ -1398,13 +1447,13 @@ impl App {
                     ui.vertical_centered(|ui| {
                         ui.label(
                             RichText::new(
-                                "No installed games found from Steam, Epic, GOG or Xbox.",
+                                lang::tr("No installed games found from Steam, Epic, GOG or Xbox.", "未从 Steam、Epic、GOG 或 Xbox 找到已安装的游戏。"),
                             )
                             .font(t::plex(13.0))
                             .color(t::TEXT_MUTED),
                         );
                         ui.label(
-                            RichText::new("Use Add a folder to point at a game by hand.")
+                            RichText::new(lang::tr("Use Add a folder to point at a game by hand.", "使用「添加文件夹」手动指定游戏。"))
                                 .font(t::plex(12.0))
                                 .color(t::TEXT_DIM),
                         );
@@ -1504,7 +1553,7 @@ impl App {
             p.galley(chip.min + pad, galley, t::BG);
             // A game this tool set up whose files upstream has moved past.
             if !m.stale.is_empty() && self.updating != Some(i) {
-                let galley = p.layout_no_wrap("UPDATE".to_owned(), font, t::BG);
+                let galley = p.layout_no_wrap(lang::tr("UPDATE", "更新").to_owned(), font, t::BG);
                 let badge = egui::Rect::from_min_size(
                     egui::pos2(poster.left() + 8.0, poster.top() + 8.0),
                     galley.size() + pad * 2.0,
@@ -1519,13 +1568,13 @@ impl App {
             );
             p.rect_filled(band, CornerRadius::ZERO, Color32::from_black_alpha(170));
             let mut x = band.left() + 10.0;
-            let dlss_label = if m.has_dlss { "DLSS own" } else { "no DLSS" };
+            let dlss_label = if m.has_dlss { lang::tr("DLSS own", "自带 DLSS") } else { lang::tr("no DLSS", "无 DLSS") };
             let ready_label = if !m.stale.is_empty() {
-                "stale"
+                lang::tr("stale", "待更新")
             } else if m.ready {
-                "ready"
+                lang::tr("ready", "就绪")
             } else if m.installed {
-                "partial"
+                lang::tr("partial", "部分安装")
             } else {
                 "—"
             };
@@ -1589,13 +1638,13 @@ impl App {
             let m = self.meta.get(&i);
             let stale = m
                 .filter(|m| !m.stale.is_empty())
-                .map(|m| format!("\n\nOut of date:\n  {}", m.stale.join("\n  ")))
+                .map(|m| crate::trfmt!("\n\nOut of date:\n  {}", "\n\n已过时：\n  {}", m.stale.join("\n  ")))
                 .unwrap_or_default();
             let mut caps = String::new();
             if let Some(m) = m {
                 let mut bits = Vec::new();
                 if m.rt_likely {
-                    bits.push("RT-likely");
+                    bits.push(lang::tr("RT-likely", "疑似光追"));
                 }
                 if m.unreal_likely {
                     bits.push("Unreal");
@@ -1607,13 +1656,13 @@ impl App {
                     bits.push("RE Engine");
                 }
                 if !bits.is_empty() {
-                    caps = format!("\nCaps: {}", bits.join(", "));
+                    caps = crate::trfmt!("\nCaps: {}", "\n特性：{}", bits.join(", "));
                 }
                 if m.shaders_missing {
-                    caps.push_str("\nWarning: shaders missing");
+                    caps.push_str(lang::tr("\nWarning: shaders missing", "\n警告：缺少着色器"));
                 }
                 if let Some(w) = &m.wrong_folder {
-                    caps.push_str(&format!("\nWarning: {w}"));
+                    caps.push_str(&crate::trfmt!("\nWarning: {w}", "\n警告：{w}"));
                 }
             }
             resp.clone().on_hover_text(format!(
@@ -1631,9 +1680,9 @@ impl App {
             let pct = self.progress.min(100);
             let title = p.layout_no_wrap(
                 if self.running {
-                    format!("Updating… {pct}%")
+                    crate::trfmt!("Updating… {pct}%", "正在更新… {pct}%")
                 } else {
-                    "Finishing…".to_owned()
+                    lang::tr("Finishing…", "正在收尾…").to_owned()
                 },
                 t::plex_semibold(13.0),
                 t::TEXT,
@@ -1682,11 +1731,11 @@ impl App {
         // Primary Install / Update on the card (not only the context menu).
         if meta_ready && self.updating != Some(i) && !self.running {
             let label = if !installed {
-                "Install"
+                lang::tr("Install", "安装")
             } else if stale {
-                "Update"
+                lang::tr("Update", "更新")
             } else {
-                "Re-install"
+                lang::tr("Re-install", "重新安装")
             };
             let btn_h = 28.0;
             let btn = egui::Rect::from_min_size(
@@ -1727,7 +1776,7 @@ impl App {
         if installed || g.store == Store::Manual {
             resp.context_menu(|ui| {
                 if installed {
-                    let label = if stale { "Update" } else { "Re-install" };
+                    let label = if stale { lang::tr(lang::tr("Update", "更新"), "更新") } else { lang::tr(lang::tr("Re-install", "重新安装"), "重新安装") };
                     if ui
                         .add_enabled(!self.running, egui::Button::new(label))
                         .clicked()
@@ -1736,7 +1785,7 @@ impl App {
                         ui.close();
                     }
                 }
-                if g.store == Store::Manual && ui.button("Forget this game").clicked() {
+                if g.store == Store::Manual && ui.button(lang::tr("Forget this game", "忘记此游戏")).clicked() {
                     action = CardAction::Forget;
                     ui.close();
                 }
@@ -1746,7 +1795,7 @@ impl App {
     }
 
     fn settings_page(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Settings").font(t::sora(16.0)).color(t::TEXT));
+        ui.label(RichText::new(lang::tr("Settings", "设置")).font(t::sora(16.0)).color(t::TEXT));
         ui.label(
             RichText::new(
                 "User install defaults — saved to settings.json and applied on new Install \
@@ -1759,7 +1808,7 @@ impl App {
         ui.add_space(10.0);
 
         ui.label(
-            RichText::new("Quality seed (user install)")
+            RichText::new(lang::tr("Quality seed (user install)", "画质种子（用户安装）"))
                 .font(t::plex_semibold(13.0))
                 .color(t::TEXT),
         );
@@ -1779,13 +1828,13 @@ impl App {
 
         ui.add_space(8.0);
         ui.label(
-            RichText::new("Feeder knobs (user install overrides)")
+            RichText::new(lang::tr("Feeder knobs (user install overrides)", "Feeder 参数（用户安装覆盖）"))
                 .font(t::plex_semibold(13.0))
                 .color(t::TEXT),
         );
         ui.label(
             RichText::new(
-                "Unset sliders follow the quality seed. Explicit values override on Install.",
+                lang::tr("Unset sliders follow the quality seed. Explicit values override on Install.", "未设置的滑杆跟随画质种子。显式设置的值会在安装时覆盖。"),
             )
             .font(t::plex(11.0))
             .color(t::TEXT_DIM),
@@ -1807,7 +1856,7 @@ impl App {
             if ui
                 .add(
                     egui::Slider::new(&mut reset, 0..=2)
-                        .text("reset_mode (0 off / 1 every / 2 adaptive)"),
+                        .text(lang::tr("reset_mode (0 off / 1 every / 2 adaptive)", "reset_mode（0 关 / 1 每次 / 2 自适应）")),
                 )
                 .changed()
             {
@@ -1825,7 +1874,7 @@ impl App {
 
         ui.add_space(8.0);
         ui.label(
-            RichText::new("Overlay UX (user install)")
+            RichText::new(lang::tr("Overlay UX (user install)", "覆盖层 UX（用户安装）"))
                 .font(t::plex_semibold(13.0))
                 .color(t::TEXT),
         );
@@ -1846,7 +1895,7 @@ impl App {
             if ui
                 .add_enabled(
                     self.resolved_exe.is_some(),
-                    egui::Button::new("Apply defaults to this game"),
+                    egui::Button::new(lang::tr("Apply defaults to this game", "将默认值应用到当前游戏")),
                 )
                 .clicked()
             {
@@ -1854,7 +1903,7 @@ impl App {
                 self.apply_settings_to_game();
             }
             if ui
-                .button("Reset to Feeder defaults")
+                .button(lang::tr("Reset to Feeder defaults", "恢复 Feeder 默认值"))
                 .on_hover_text(
                     "Restore form to Feeder stock: work_resolution=100, ofa off (grid 2 / perf 10), \
                      reset_mode=2 adaptive, light_stab off, engine_velocity on, overlay log_detail=1 / \
@@ -1874,7 +1923,7 @@ impl App {
             .color(t::TEXT_DIM),
         );
         ui.label(
-            RichText::new(format!("File: {}", Settings::path().display()))
+            RichText::new(crate::trfmt!("File: {}", "文件：{}", Settings::path().display()))
                 .font(t::mono(11.0))
                 .color(t::TEXT_DIM),
         );
@@ -1884,7 +1933,7 @@ impl App {
         ui.add_space(6.0);
         ui.separator();
         ui.label(
-            RichText::new("Feeder knobs (offline)")
+            RichText::new(lang::tr("Feeder knobs (offline)", "Feeder 参数（离线）"))
                 .font(t::plex_semibold(13.0))
                 .color(t::TEXT),
         );
@@ -1895,12 +1944,12 @@ impl App {
                         .font(t::plex(12.0))
                         .color(t::TEXT_MUTED),
                 );
-                if ui.button("Install DLSS 5").clicked() {
+                if ui.button(lang::tr("Install DLSS 5", "安装 DLSS 5")).clicked() {
                     self.start(None);
                 }
             } else {
                 ui.label(
-                    RichText::new("Select a game first.")
+                    RichText::new(lang::tr("Select a game first.", "请先选择一个游戏。"))
                         .font(t::plex(12.0))
                         .color(t::TEXT_DIM),
                 );
@@ -1920,7 +1969,7 @@ impl App {
                 .changed();
             changed |= sharp;
             changed |= ui
-                .checkbox(&mut k.ofa_enabled, "Optical Flow (ofa)")
+                .checkbox(&mut k.ofa_enabled, lang::tr("Optical Flow (ofa)", "光流（ofa）"))
                 .changed();
             if k.ofa_enabled {
                 changed |= ui
@@ -1962,9 +2011,9 @@ impl App {
         }
         ui.horizontal(|ui| {
             let write = egui::Button::new(if self.knobs_dirty {
-                "Write cfg *"
+                lang::tr("Write cfg *", "写入 cfg *")
             } else {
-                "Write cfg"
+                lang::tr("Write cfg", "写入 cfg")
             });
             if ui.add_enabled(self.knobs.is_some(), write).clicked() {
                 if let (Some(exe), Some(k)) = (self.exe(), self.knobs.clone()) {
@@ -1982,7 +2031,7 @@ impl App {
                     }
                 }
             }
-            if ui.button("Reload from disk").clicked() {
+            if ui.button(lang::tr("Reload from disk", "从磁盘重新加载")).clicked() {
                 self.reload_knobs_and_perf();
             }
         });
@@ -2033,18 +2082,18 @@ fn store_mark(
 }
 
 fn about_page(ui: &mut egui::Ui) {
-    ui.label(RichText::new("About").font(t::sora(16.0)).color(t::TEXT));
+    ui.label(RichText::new(lang::tr("About", "关于")).font(t::sora(16.0)).color(t::TEXT));
     ui.label(
-        RichText::new(concat!(
-            "DLSS5oneclick v",
+        RichText::new(format!(
+            "DLSS5oneclick v{} {}",
             env!("CARGO_PKG_VERSION"),
-            " — one click for the leaked DLSS 5 neural-rendering build in any DX11/DX12 game."
+            lang::tr("— one click for the leaked DLSS 5 neural-rendering build in any DX11/DX12 game.", "—— 一键为任意 DX11/DX12 游戏安装泄露版 DLSS 5 神经渲染组件。")
         ))
         .font(t::plex(12.5))
         .color(t::TEXT_SOFT),
     );
     ui.add_space(6.0);
-    ui.label(RichText::new("Everything it installs is downloaded from the projects that made it. Credits and sources:").font(t::plex(12.0)).color(t::TEXT_MUTED));
+    ui.label(RichText::new(lang::tr("Everything it installs is downloaded from the projects that made it. Credits and sources:", "它安装的所有内容均来自各自的开发项目。致谢与来源：")).font(t::plex(12.0)).color(t::TEXT_MUTED));
     for (name, url) in [
         ("crosire — ReShade", "https://reshade.me"),
         (
@@ -2076,8 +2125,8 @@ fn about_page(ui: &mut egui::Ui) {
             "https://github.com/praydog/REFramework",
         ),
         (
-            "Source, issues and releases",
-            "https://github.com/faisalkindi/DLSS5oneclick",
+            lang::tr("Source, issues and releases", "源码、问题与发布"),
+            "https://github.com/goule0704-png/DLSS5oneclick",
         ),
     ] {
         ui.hyperlink_to(
@@ -2091,6 +2140,10 @@ impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string("exe", self.exe_text.clone());
         storage.set_string("skip_version", self.skipped_version.clone());
+        storage.set_string(
+            "lang",
+            if self.lang == lang::Lang::Zh { "zh" } else { "en" }.into(),
+        );
         storage.set_string(
             "tip_dismissed",
             if self.tip_dismissed { "1" } else { "0" }.into(),
@@ -2166,10 +2219,10 @@ impl eframe::App for App {
                     ui.add_space(22.0);
                     let setup_enabled = self.resolved_exe.is_some();
                     for (page, label, enabled) in [
-                        (Page::Games, "Games", true),
-                        (Page::Setup, "Setup", setup_enabled),
-                        (Page::Settings, "Settings", true),
-                        (Page::About, "About", true),
+                        (Page::Games, lang::tr("Games", "游戏"), true),
+                        (Page::Setup, lang::tr("Setup", "设置"), setup_enabled),
+                        (Page::Settings, lang::tr("Settings", "设置"), true),
+                        (Page::About, lang::tr("About", "关于"), true),
                     ] {
                         let active = self.page == page;
                         let galley = ui.painter().layout_no_wrap(
@@ -2232,7 +2285,7 @@ impl eframe::App for App {
                                         )
                                     });
                         }
-                        let label = "Buy me a Cup of Coffee";
+                        let label = lang::tr("Buy me a Cup of Coffee", "请我喝杯咖啡");
                         let galley = ui.painter().layout_no_wrap(
                             label.to_owned(),
                             t::plex_semibold(12.5),
@@ -2266,13 +2319,40 @@ impl eframe::App for App {
                         {
                             ui.ctx().open_url(egui::OpenUrl::new_tab(KOFI_URL));
                         }
+                        // ── language switch ───────────────────────
+                        let lang_label = match lang::get() {
+                            lang::Lang::Zh => "EN",
+                            lang::Lang::En => "中文",
+                        };
+                        let lang_btn = egui::Button::new(
+                            RichText::new(lang_label)
+                                .font(t::plex_medium(12.5))
+                                .color(t::TEXT_OFF),
+                        )
+                        .fill(Color32::TRANSPARENT)
+                        .stroke(Stroke::new(1.0, t::BORDER_STRONG))
+                        .corner_radius(CornerRadius::same(8))
+                        .min_size(Vec2::new(54.0, 30.0));
+                        if ui
+                            .add(lang_btn)
+                            .on_hover_text("界面语言 / Language")
+                            .clicked()
+                        {
+                            let next = match lang::get() {
+                                lang::Lang::Zh => lang::Lang::En,
+                                lang::Lang::En => lang::Lang::Zh,
+                            };
+                            self.lang = next;
+                            lang::set(next);
+                            ui.ctx().request_repaint();
+                        }
                         chip(
                             ui,
                             concat!("v", env!("CARGO_PKG_VERSION")),
                             t::TEXT_DIM,
                             false,
                         );
-                        chip(ui, "LEAKED BUILD", t::ACCENT, true);
+                        chip(ui, lang::tr("LEAKED BUILD", "泄露版"), t::ACCENT, true);
                         let (r, _) =
                             ui.allocate_exact_size(Vec2::new(64.0, 20.0), egui::Sense::hover());
                         ui.painter().circle_filled(
@@ -2283,7 +2363,7 @@ impl eframe::App for App {
                         ui.painter().text(
                             r.left_center() + Vec2::new(14.0, 0.0),
                             egui::Align2::LEFT_CENTER,
-                            "Ready",
+                            lang::tr("Ready", "就绪"),
                             t::plex_semibold(12.0),
                             t::TEXT,
                         );
@@ -2311,8 +2391,7 @@ impl eframe::App for App {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 10.0;
                             ui.label(
-                                RichText::new(format!(
-                                    "Version {} is available (you have {}).",
+                                RichText::new(crate::trfmt!("Version {} is available (you have {}).", "新版本 {} 可用（当前版本 {}）。",
                                     av.version,
                                     update::CURRENT
                                 ))
@@ -2320,7 +2399,7 @@ impl eframe::App for App {
                                 .color(t::TEXT),
                             );
                             let upd = egui::Button::new(
-                                RichText::new("Update")
+                                RichText::new(lang::tr("Update", "更新"))
                                     .font(t::plex_semibold(12.5))
                                     .color(t::BG),
                             )
@@ -2330,16 +2409,16 @@ impl eframe::App for App {
                             if ui.add(upd).clicked() {
                                 self.start_update_download(av.clone());
                             }
-                            if ui.button("Later").clicked() {
+                            if ui.button(lang::tr("Later", "稍后")).clicked() {
                                 self.update = UpdateState::Idle;
                             }
-                            if ui.button("Skip this version").clicked() {
+                            if ui.button(lang::tr("Skip this version", "跳过此版本")).clicked() {
                                 self.skipped_version = av.version.clone();
                                 self.update = UpdateState::Idle;
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 ui.hyperlink_to(
-                                    RichText::new("release notes").font(t::plex(11.5)),
+                                    RichText::new(lang::tr("release notes", "更新日志")).font(t::plex(11.5)),
                                     format!(
                                         "https://github.com/{}/releases/tag/{}",
                                         update::REPO,
@@ -2367,7 +2446,7 @@ impl eframe::App for App {
                     )
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new(format!("Updating: {pct}% {msg}"))
+                            RichText::new(crate::trfmt!("Updating: {pct}% {msg}", "正在更新：{pct}% {msg}"))
                                 .font(t::plex(12.0))
                                 .color(t::TEXT_MUTED),
                         );
@@ -2388,7 +2467,7 @@ impl eframe::App for App {
                     )
                     .show(ui, |ui| {
                         ui.label(
-                            RichText::new("Updated. Restarting...")
+                            RichText::new(lang::tr("Updated. Restarting...", "已更新，正在重启…"))
                                 .font(t::plex(12.0))
                                 .color(t::ACCENT),
                         );
@@ -2410,11 +2489,11 @@ impl eframe::App for App {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new(format!("Update failed: {e}"))
+                                RichText::new(crate::trfmt!("Update failed: {e}", "更新失败：{e}"))
                                     .font(t::plex(12.0))
                                     .color(t::DANGER),
                             );
-                            if ui.button("Dismiss").clicked() {
+                            if ui.button(lang::tr("Dismiss", "知道了")).clicked() {
                                 self.update = UpdateState::Idle;
                             }
                         });
@@ -2439,22 +2518,22 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label(
-                                RichText::new("Quick tip")
+                                RichText::new(lang::tr("Quick tip", "小贴士"))
                                     .font(t::plex_semibold(13.0))
                                     .color(t::TEXT),
                             );
                             ui.label(
                                 RichText::new(
-                                    "This tool installs ReShade + DLSS5-Feeder + neural DLSS for games that ship without DLSS. \
+                                    lang::tr("This tool installs ReShade + DLSS5-Feeder + neural DLSS for games that ship without DLSS. \
                                      After Install: in-game press Home → Add-ons tab → enable DLSS 5 Neural Rendering. \
-                                     Use Settings to seed Feeder defaults on the next Install.",
+                                     Use Settings to seed Feeder defaults on the next Install.", "本工具为没有 DLSS 的游戏安装 ReShade + DLSS5-Feeder + 神经 DLSS。安装后：游戏内按 Home → Add-ons 标签页 → 启用 DLSS 5 Neural Rendering。使用「设置」可在下次安装时预设 Feeder 默认值。"),
                                 )
                                 .font(t::plex(12.0))
                                 .color(t::TEXT_SOFT),
                             );
                         });
                         ui.with_layout(Layout::right_to_left(Align::TOP), |ui| {
-                            if ui.button("Got it").clicked() {
+                            if ui.button(lang::tr("Got it", "知道了")).clicked() {
                                 self.tip_dismissed = true;
                             }
                         });
@@ -2486,7 +2565,7 @@ impl eframe::App for App {
                         let busy = self.update_rx.is_some()
                             || !matches!(self.update, UpdateState::Idle);
                         let btn = egui::Button::new(
-                            RichText::new("Check for updates")
+                            RichText::new(lang::tr("Check for updates", "检查更新"))
                                 .font(t::plex_medium(12.5))
                                 .color(t::TEXT),
                         )
@@ -2506,10 +2585,11 @@ impl eframe::App for App {
                             && self.update_rx.is_none()
                         {
                             ui.label(
-                                RichText::new(concat!(
-                                    "You are on the newest release (v",
+                                RichText::new(format!(
+                                    "{}{}{}",
+                                    lang::tr("You are on the newest release (v", "你已是最新版本（v"),
                                     env!("CARGO_PKG_VERSION"),
-                                    ")."
+                                    lang::tr(").", "）。")
                                 ))
                                 .font(t::plex(12.0))
                                 .color(t::TEXT_MUTED),
@@ -2547,7 +2627,7 @@ impl eframe::App for App {
                                         .frame(Frame::NONE)
                                         .font(t::mono(12.0))
                                         .text_color(t::TEXT_SOFT)
-                                        .hint_text(RichText::new("Game folder or the game's .exe").color(t::TEXT_DIM))
+                                        .hint_text(RichText::new(lang::tr("Game folder or the game's .exe", "游戏文件夹或游戏 .exe")).color(t::TEXT_DIM))
                                         .desired_width(f32::INFINITY),
                                 );
                                 if r.changed() {
@@ -2556,8 +2636,8 @@ impl eframe::App for App {
                             });
                         });
                     let start_dir = self.exe().and_then(|p| p.parent().map(|d| d.to_path_buf()));
-                    if ui.add_sized([96.0, 40.0], egui::Button::new("Game folder…")).clicked() {
-                        let mut dlg = rfd::FileDialog::new().set_title("Pick the game's install folder");
+                    if ui.add_sized([96.0, 40.0], egui::Button::new(lang::tr("Game folder…", "游戏文件夹…"))).clicked() {
+                        let mut dlg = rfd::FileDialog::new().set_title(lang::tr("Pick the game's install folder", "选择游戏安装文件夹"));
                         if let Some(d) = &start_dir { dlg = dlg.set_directory(d); }
                         if let Some(p) = dlg.pick_folder() {
                             self.exe_text = p.to_string_lossy().into_owned();
@@ -2565,7 +2645,7 @@ impl eframe::App for App {
                         }
                     }
                     if ui.add_sized([96.0, 40.0], egui::Button::new("Exe…")).clicked() {
-                        let mut dlg = rfd::FileDialog::new().add_filter("Executables", &["exe", "bin"]);
+                        let mut dlg = rfd::FileDialog::new().add_filter(lang::tr("Executables", "可执行文件"), &["exe", "bin"]);
                         if let Some(d) = &start_dir { dlg = dlg.set_directory(d); }
                         if let Some(p) = dlg.pick_file() {
                             self.exe_text = p.to_string_lossy().into_owned();
@@ -2584,7 +2664,7 @@ impl eframe::App for App {
                     };
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        ui.label(RichText::new("Game exe").font(t::plex(12.0)).color(t::TEXT_MUTED));
+                        ui.label(RichText::new(lang::tr("Game exe", "游戏 exe")).font(t::plex(12.0)).color(t::TEXT_MUTED));
                         if self.candidates.len() > 1 {
                             let mut pick = exe.clone();
                             egui::ComboBox::from_id_salt("exe_pick")
@@ -2603,8 +2683,7 @@ impl eframe::App for App {
                         }
                         if let Some(s) = &ok_status {
                             ui.label(
-                                RichText::new(format!(
-                                    "{}-bit · {}{}",
+                                RichText::new(crate::trfmt!("{}-bit · {}{}", "{}-位 · {}{}",
                                     s.bitness,
                                     s.api.label(),
                                     s.gpu.as_ref().map(|(g, t)| format!(" · {} ({})", g.name, t.label())).unwrap_or_default()
@@ -2618,14 +2697,14 @@ impl eframe::App for App {
                             let name = |m: Option<game::Mode>| match m {
                                 None => match s.mode_detected {
                                     game::Mode::Native => {
-                                        "Auto: native DLSS · renodx hooks game (Feeder Optimize N/A)"
+                                        lang::tr("Auto: native DLSS · renodx hooks game (Feeder Optimize N/A)", "自动：原生 DLSS · renodx 挂钩游戏（Feeder Optimize 不适用）")
                                     }
-                                    game::Mode::Feeder => "Auto: no DLSS · Feeder path + Optimize",
+                                    game::Mode::Feeder => lang::tr("Auto: no DLSS · Feeder path + Optimize", "自动：无 DLSS · Feeder 路径 + 优化"),
                                 },
                                 Some(game::Mode::Native) => {
-                                    "Force native DLSS (Feeder Optimize N/A)"
+                                    lang::tr("Force native DLSS (Feeder Optimize N/A)", "强制原生 DLSS（Feeder Optimize 不适用）")
                                 }
-                                Some(game::Mode::Feeder) => "Force no-DLSS (Feeder + Optimize)",
+                                Some(game::Mode::Feeder) => lang::tr("Force no-DLSS (Feeder + Optimize)", "强制无 DLSS（Feeder + 优化）"),
                             };
                             let before = choice;
                             egui::ComboBox::from_id_salt("mode_pick")
@@ -2655,10 +2734,10 @@ impl eframe::App for App {
                 {
                     ui.label(
                         RichText::new(
-                            "DirectX 9: Install will download dgVoodoo 2.87.3 into the game folder \
+                            lang::tr("DirectX 9: Install will download dgVoodoo 2.87.3 into the game folder \
                              first (official GitHub release → d3d9.dll + dgVoodoo.conf), then continue \
                              with ReShade / Feeder. / DirectX 9: Install сначала скачает dgVoodoo 2.87.3 \
-                             в папку игры, затем продолжит установку.",
+                             в папку игры, затем продолжит установку.", "DirectX 9：安装会先把 dgVoodoo 2.87.3 下载到游戏文件夹（官方 GitHub 发布 → d3d9.dll + dgVoodoo.conf），然后继续 ReShade / Feeder 的安装。"),
                         )
                         .font(t::plex(12.0))
                         .color(t::TEXT_SOFT),
@@ -2667,26 +2746,26 @@ impl eframe::App for App {
                 if let Some(s) = &ok_status {
                     let mut caps: Vec<&str> = Vec::new();
                     if s.mode == game::Mode::Native {
-                        caps.push("Native DLSS (Feeder Optimize N/A)");
+                        caps.push(lang::tr("Native DLSS (Feeder Optimize N/A)", "原生 DLSS（Feeder 优化不适用）"));
                     }
                     if s.rt_likely {
-                        caps.push("RT-likely");
+                        caps.push(lang::tr("RT-likely", "疑似光追"));
                     }
                     if s.re_engine {
                         caps.push("RE Engine");
                     }
                     if s.unreal_likely {
-                        caps.push("Unreal-likely");
+                        caps.push(lang::tr("Unreal-likely", "疑似 Unreal"));
                     }
                     if s.unity_likely {
-                        caps.push("Unity-likely");
+                        caps.push(lang::tr("Unity-likely", "疑似 Unity"));
                     }
                     if s.api == game::Api::Dx12 && s.mode == game::Mode::Feeder {
-                        caps.push("DX12 Feeder (Optimize, no OFA)");
+                        caps.push(lang::tr("DX12 Feeder (Optimize, no OFA)", "DX12 Feeder（优化，无 OFA）"));
                     }
                     if !caps.is_empty() {
                         ui.label(
-                            RichText::new(format!("Caps: {}", caps.join(" · ")))
+                            RichText::new(crate::trfmt!("Caps: {}", "特性：{}", caps.join(" · ")))
                                 .font(t::plex(11.5))
                                 .color(t::TEXT_MUTED),
                         );
@@ -2706,7 +2785,7 @@ impl eframe::App for App {
                     let cb = egui::Checkbox::new(
                         &mut on,
                         RichText::new(
-                            "That is not the card I game on \u{2014} Remote Desktop, a virtual display, or a misread. Check anyway, at my own risk",
+                            lang::tr("That is not the card I game on \u{2014} Remote Desktop, a virtual display, or a misread. Check anyway, at my own risk", "我玩游戏用的不是这张显卡 —— 远程桌面、虚拟显示器或识别有误。仍要检查，风险自负"),
                         )
                         .font(t::plex(11.5))
                         .color(t::TEXT_SOFT),
@@ -2723,7 +2802,7 @@ impl eframe::App for App {
                     let cb = egui::Checkbox::new(
                         &mut on,
                         RichText::new(
-                            "Black screen, crash or driver reset with DLSS 5 on? Install the classic add-on build (4.55)",
+                            lang::tr("Black screen, crash or driver reset with DLSS 5 on? Install the classic add-on build (4.55)", "开启 DLSS 5 后黑屏、崩溃或驱动重置？请安装经典附加组件版本（4.55）"),
                         )
                         .font(t::plex(11.5))
                         .color(t::TEXT_SOFT),
@@ -2734,8 +2813,7 @@ impl eframe::App for App {
                 }
                 if let Some(ac) = ok_status.as_ref().and_then(|s| s.anticheat) {
                     let mut on = game::ignore_anticheat();
-                    let label = format!(
-                        "{ac} is switched off for offline play in this game (GTA V: BattlEye unticked in the Rockstar Games Launcher, or -nobattleye) — install anyway, at my own risk"
+                    let label = crate::trfmt!("{ac} is switched off for offline play in this game (GTA V: BattlEye unticked in the Rockstar Games Launcher, or -nobattleye) — install anyway, at my own risk", "{ac} 已在此游戏中为离线游玩关闭（GTA V：在 Rockstar Games Launcher 中取消勾选 BattlEye，或使用 -nobattleye）—— 仍要安装，风险自负"
                     );
                     let cb = egui::Checkbox::new(&mut on, RichText::new(label).font(t::plex(11.5)).color(t::TEXT_SOFT));
                     if ui.add_enabled(!self.running, cb).changed() {
@@ -2752,15 +2830,15 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 8.0;
                     ui.label(
-                        RichText::new("INSTALL ENGINE")
+                        RichText::new(lang::tr("INSTALL ENGINE", "安装引擎"))
                             .font(t::plex_semibold(11.0))
                             .color(t::TEXT_MUTED),
                     );
                     ui.label(
                         RichText::new(if native {
-                            "— two ways to run DLSS 5 in this game, pick one"
+                            lang::tr("— two ways to run DLSS 5 in this game, pick one", "—— 在此游戏中运行 DLSS 5 有两种方式，请选其一")
                         } else {
-                            "— this game has no DLSS of its own, so only the ReShade path can work"
+                            lang::tr("— this game has no DLSS of its own, so only the ReShade path can work", "—— 此游戏本身没有 DLSS，因此只能使用 ReShade 方式")
                         })
                         .font(t::plex(11.0))
                         .color(t::TEXT_DIM),
@@ -2783,8 +2861,8 @@ impl eframe::App for App {
                         left,
                         self.engine == Engine::ReShade,
                         true,
-                        "ReShade + DLSS 5 add-on",
-                        &["The default. Works in every supported game.", "In game: Home → Add-ons → DLSS 5 Neural Rendering."],
+                        lang::tr("ReShade + DLSS 5 add-on", "ReShade + DLSS 5 附加组件"),
+                        &[lang::tr("The default. Works in every supported game.", "默认方案。适用于所有受支持的游戏。"), lang::tr("In game: Home → Add-ons → DLSS 5 Neural Rendering.", "游戏中：Home → Add-ons → DLSS 5 Neural Rendering。")],
                         "",
                     ) {
                         self.engine = Engine::ReShade;
@@ -2794,12 +2872,12 @@ impl eframe::App for App {
                         right,
                         self.engine == Engine::Opti,
                         native,
-                        "OptiScaler (built-in NR pass)",
-                        &["Dagherbou's fork, no ReShade. Also swaps upscalers.", "In game: Insert → enable Neural Rendering."],
+                        lang::tr("OptiScaler (built-in NR pass)", "OptiScaler（内置 NR 通道）"),
+                        &[lang::tr("Dagherbou's fork, no ReShade. Also swaps upscalers.", "Dagherbou 分支版，无需 ReShade。还能替换升频器。"), lang::tr("In game: Insert → enable Neural Rendering.", "游戏中：Insert → 启用 Neural Rendering。")],
                         if native {
                             ""
                         } else {
-                            "Needs a game with its own DLSS — this one has none."
+                            lang::tr("Needs a game with its own DLSS — this one has none.", "需要游戏自带 DLSS —— 此游戏没有。")
                         },
                     ) {
                         self.engine = Engine::Opti;
@@ -2810,12 +2888,12 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         ui.label(
-                            RichText::new("OPTISCALER BUILD")
+                            RichText::new(lang::tr("OPTISCALER BUILD", "OPTISCALER 版本"))
                                 .font(t::plex_semibold(11.0))
                                 .color(t::TEXT_MUTED),
                         );
                         for (presr, label) in
-                            [(false, "Stable"), (true, "Pre-SR multipass \u{00b7} experimental")]
+                            [(false, lang::tr("Stable", "稳定版")), (true, lang::tr("Pre-SR multipass \u{00b7} experimental", "Pre-SR 多通道 · 实验性"))]
                         {
                             let on = self.opti_presr == presr;
                             let btn = egui::Button::new(
@@ -2851,13 +2929,13 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         ui.label(
-                            RichText::new("MODEL RESOLUTION")
+                            RichText::new(lang::tr("MODEL RESOLUTION", "模型分辨率"))
                                 .font(t::plex_semibold(11.0))
                                 .color(t::TEXT_MUTED),
                         );
                         ui.label(
                             RichText::new(
-                                "\u{2014} the frame stays full size; only the model's own work is done smaller",
+                                lang::tr("\u{2014} the frame stays full size; only the model's own work is done smaller", "—— 帧保持全尺寸；只有模型自身的工作在更小尺寸完成"),
                             )
                             .font(t::plex(11.0))
                             .color(t::TEXT_DIM),
@@ -2867,9 +2945,9 @@ impl eframe::App for App {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         // Cost falls with the square, so the saving is worth naming.
                         for (scale, label, note) in [
-                            (1.0_f32, "100%", "full cost"),
-                            (0.75, "75%", "about half the cost"),
-                            (0.5, "50%", "about a quarter"),
+                            (1.0_f32, "100%", lang::tr("full cost", "全开销")),
+                            (0.75, "75%", lang::tr("about half the cost", "约一半开销")),
+                            (0.5, "50%", lang::tr("about a quarter", "约四分之一")),
                         ] {
                             let on = (self.working_scale - scale).abs() < 0.01;
                             let btn = egui::Button::new(
@@ -2887,9 +2965,9 @@ impl eframe::App for App {
                         }
                         ui.label(
                             RichText::new(match self.working_scale {
-                                s if s >= 0.99 => "The model runs at full output resolution.",
-                                s if s >= 0.74 => "Costs about half as much; the biggest single fps lever here.",
-                                _ => "Costs about a quarter; the model's contribution is softer.",
+                                s if s >= 0.99 => lang::tr("The model runs at full output resolution.", "模型以完整输出分辨率运行。"),
+                                s if s >= 0.74 => lang::tr("Costs about half as much; the biggest single fps lever here.", "开销约减半；这是最大的单项帧率杠杆。"),
+                                _ => lang::tr("Costs about a quarter; the model's contribution is softer.", "开销约四分之一；模型的贡献更轻。"),
                             })
                             .font(t::plex(11.0))
                             .color(t::TEXT_DIM),
@@ -2904,15 +2982,15 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         ui.label(
-                            RichText::new("WHICH NEURAL ADD-ON")
+                            RichText::new(lang::tr("WHICH NEURAL ADD-ON", "选择神经附加组件"))
                                 .font(t::plex_semibold(11.0))
                                 .color(t::TEXT_MUTED),
                         );
                         ui.label(
                             RichText::new(if native {
-                                "\u{2014} both run DLSS 5; they differ in where the network runs"
+                                lang::tr("\u{2014} both run DLSS 5; they differ in where the network runs", "—— 两者都运行 DLSS 5；区别在于网络运行的位置")
                             } else {
-                                "\u{2014} only the stable add-on works in a game with no DLSS of its own"
+                                lang::tr("\u{2014} only the stable add-on works in a game with no DLSS of its own", "—— 在本身没有 DLSS 的游戏中，只有稳定版附加组件可用")
                             })
                             .font(t::plex(11.0))
                             .color(t::TEXT_DIM),
@@ -2934,10 +3012,10 @@ impl eframe::App for App {
                         left,
                         !self.upstream_on,
                         true,
-                        "Stable \u{2014} RenoDX DLSS 5 add-on",
+                        lang::tr("Stable \u{2014} RenoDX DLSS 5 add-on", "稳定版 —— RenoDX DLSS 5 附加组件"),
                         &[
-                            "The proven route. The network runs after the upscaler, at output resolution.",
-                            "In game: Home \u{2192} Add-ons \u{2192} DLSS 5 Neural Rendering.",
+                            lang::tr("The proven route. The network runs after the upscaler, at output resolution.", "经过验证的方案。网络在升频器之后、以输出分辨率运行。"),
+                            lang::tr("In game: Home \u{2192} Add-ons \u{2192} DLSS 5 Neural Rendering.", "游戏中：Home → Add-ons → DLSS 5 Neural Rendering。"),
                         ],
                         "",
                     ) {
@@ -2948,15 +3026,15 @@ impl eframe::App for App {
                         right,
                         self.upstream_on,
                         native,
-                        "Experimental \u{2014} Neural Upstream",
+                        lang::tr("Experimental \u{2014} Neural Upstream", "实验性 —— 神经上游"),
                         &[
-                            "Runs the network before the upscaler, at render resolution, so it costs less.",
-                            "Replaces the add-on on the left. Read the warning below first.",
+                            lang::tr("Runs the network before the upscaler, at render resolution, so it costs less.", "在升频器之前、以渲染分辨率运行网络，开销更低。"),
+                            lang::tr("Replaces the add-on on the left. Read the warning below first.", "取代左侧的附加组件。请先阅读下方警告。"),
                         ],
                         if native {
                             ""
                         } else {
-                            "Needs a game with its own DLSS \u{2014} this one has none."
+                            lang::tr("Needs a game with its own DLSS \u{2014} this one has none.", "需要游戏自带 DLSS —— 此游戏没有。")
                         },
                     ) {
                         self.upstream_on = true;
@@ -2969,7 +3047,7 @@ impl eframe::App for App {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;
                             ui.label(
-                                RichText::new("HOW TRANSFORMATIVE")
+                                RichText::new(lang::tr("HOW TRANSFORMATIVE", "改造强度"))
                                     .font(t::plex_semibold(11.0))
                                     .color(t::TEXT_MUTED),
                             );
@@ -2977,7 +3055,7 @@ impl eframe::App for App {
                                 .iter()
                                 .find(|(_, id, _)| *id == self.upstream_preset)
                                 .map(|(n, ..)| *n)
-                                .unwrap_or("Reference");
+                                .unwrap_or(lang::tr("Reference", "参考"));
                             egui::ComboBox::from_id_salt("upstream_preset")
                                 .selected_text(RichText::new(current).font(t::plex(12.0)))
                                 .width(150.0)
@@ -2992,24 +3070,24 @@ impl eframe::App for App {
                                 });
                             ui.label(
                                 RichText::new(match self.upstream_preset {
-                                    1 => "Keeps the lighting work, holds back invented detail.",
-                                    2 => "Half way: detail is enhanced but not rebuilt.",
-                                    4 => "Past what the network intends \u{2014} detail starts looking drawn.",
-                                    5 => "Deliberately overcooked: waxy skin, invented surfaces.",
-                                    _ => "Everything the network wants to do. Its own default.",
+                                    1 => lang::tr("Keeps the lighting work, holds back invented detail.", "保留光照工作，抑制虚构细节。"),
+                                    2 => lang::tr("Half way: detail is enhanced but not rebuilt.", "折中：细节增强但不重建。"),
+                                    4 => lang::tr("Past what the network intends \u{2014} detail starts looking drawn.", "超出网络本意 —— 细节开始显得画上去的。"),
+                                    5 => lang::tr("Deliberately overcooked: waxy skin, invented surfaces.", "刻意过火：蜡质皮肤、虚构表面。"),
+                                    _ => lang::tr("Everything the network wants to do. Its own default.", "网络想做的一切。它自己的默认值。"),
                                 })
                                 .font(t::plex(11.0))
                                 .color(t::TEXT_DIM),
                             );
                         });
                         ui.add_space(6.0);
-                        let warn = "EXPERIMENTAL. Using DLSS Frame Generation? Set this add-on to \
+                        let warn = lang::tr("EXPERIMENTAL. Using DLSS Frame Generation? Set this add-on to \
                                     Quality in the ReShade overlay, so the network runs on every \
                                     frame. At any lower setting it runs on one frame in two or \
                                     three, the rendered frame interval alternates, and frame \
                                     generation cannot pace through the swing: stutter and flashes \
                                     that get worse the higher the multiplier. Its author tested it \
-                                    against GTA V Enhanced and Bright Memory: Infinite only.";
+                                    against GTA V Enhanced and Bright Memory: Infinite only.", "实验性。正在使用 DLSS 帧生成？请在 ReShade 覆盖层中把此附加组件设为 Quality，让网络在每一帧上运行。任何更低的设置都会让它每隔两到三帧才运行一次，渲染帧间隔交替，帧生成无法应对这种摆动：倍率越高，卡顿和闪烁越严重。其作者仅在 GTA V Enhanced 和 Bright Memory: Infinite 上测试过。");
                         Frame::new()
                             .fill(Color32::from_rgb(0x2a, 0x22, 0x18))
                             .stroke(Stroke::new(1.0, Color32::from_rgb(0x7a, 0x5a, 0x22)))
@@ -3033,7 +3111,7 @@ impl eframe::App for App {
 
                 // ── component list (status, not controls) ────────
                 ui.label(
-                    RichText::new("WHAT IS IN THE GAME FOLDER")
+                    RichText::new(lang::tr("WHAT IS IN THE GAME FOLDER", "游戏文件夹中的内容"))
                         .font(t::plex_semibold(11.0))
                         .color(t::TEXT_MUTED),
                 );
@@ -3060,7 +3138,7 @@ impl eframe::App for App {
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         ui.label(
-                            RichText::new("RENODX HDR MOD")
+                            RichText::new(lang::tr("RENODX HDR MOD", "RENODX HDR 模组"))
                                 .font(t::plex_semibold(11.0))
                                 .color(t::TEXT_MUTED),
                         );
@@ -3068,25 +3146,24 @@ impl eframe::App for App {
                             ui.label(RichText::new(text).font(t::plex(11.0)).color(t::TEXT_DIM));
                         };
                         if let Some(installed) = &s.renodx_mod {
-                            dim(ui, format!("— installed: {installed} (Remove takes it out too)"));
+                            dim(ui, crate::trfmt!("— installed: {installed} (Remove takes it out too)", "—— 已安装：{installed}（「卸载」也会一并移除）"));
                         } else if !s.foreign_renodx.is_empty() {
-                            dim(ui, format!(
-                                "— already present, not installed by this tool: {} (left untouched; ReShade loads one RenoDX mod per game)",
+                            dim(ui, crate::trfmt!("— already present, not installed by this tool: {} (left untouched; ReShade loads one RenoDX mod per game)", "—— 已存在，但非本工具安装：{}（保持原样；ReShade 每个游戏只加载一个 RenoDX 模组）",
                                 s.foreign_renodx.join(", ")
                             ));
                         } else {
                             match &self.renodx {
-                                RenodxLookup::Idle | RenodxLookup::Pending => dim(ui, "— looking up clshortfuse/renodx for this game…".into()),
-                                RenodxLookup::NotFound => dim(ui, "— no RenoDX mod is published for this game.".into()),
-                                RenodxLookup::Failed(e) => dim(ui, format!("— lookup failed: {e}")),
+                                RenodxLookup::Idle | RenodxLookup::Pending => dim(ui, lang::tr("— looking up clshortfuse/renodx for this game…", "—— 正在为此游戏查询 clshortfuse/renodx…").into()),
+                                RenodxLookup::NotFound => dim(ui, lang::tr("— no RenoDX mod is published for this game.", "—— 此游戏没有发布 RenoDX 模组。").into()),
+                                RenodxLookup::Failed(e) => dim(ui, crate::trfmt!("— lookup failed: {e}", "—— 查询失败：{e}")),
                                 RenodxLookup::Found(m) => {
-                                    let label = format!("Also install {} — {}", m.file, m.status_label());
+                                    let label = crate::trfmt!("Also install {} — {}", "同时安装 {} —— {}", m.file, m.status_label());
                                     let cb = egui::Checkbox::new(&mut self.renodx_on, RichText::new(label).font(t::plex(12.0)).color(t::TEXT_SOFT));
                                     ui.add_enabled(!self.running, cb).on_hover_text(
-                                        "Game-specific HDR / tone-mapping mod from the RenoDX project. Loads beside the DLSS 5 add-on (different add-on name, different settings section). Turn Windows AutoHDR / RTX HDR off to avoid double tone mapping.",
+                                        lang::tr("Game-specific HDR / tone-mapping mod from the RenoDX project. Loads beside the DLSS 5 add-on (different add-on name, different settings section). Turn Windows AutoHDR / RTX HDR off to avoid double tone mapping.", "来自 RenoDX 项目的游戏专属 HDR / 色调映射模组。与 DLSS 5 附加组件一起加载（附加组件名称不同、设置分区不同）。请关闭 Windows AutoHDR / RTX HDR，避免重复色调映射。"),
                                     );
                                     if self.engine == Engine::Opti {
-                                        dim(ui, "— ReShade goes in as ReShade64.dll, loaded by OptiScaler (LoadReshade=true)".into());
+                                        dim(ui, lang::tr("— ReShade goes in as ReShade64.dll, loaded by OptiScaler (LoadReshade=true)", "—— ReShade 会以 ReShade64.dll 形式装入，由 OptiScaler 加载（LoadReshade=true）").into());
                                     }
                                     if !m.note.is_empty() {
                                         dim(ui, format!("— {}", m.note));
@@ -3101,7 +3178,7 @@ impl eframe::App for App {
                 let can_run = ok_status.is_some() && problems.is_empty() && !self.running;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
-                    let install = egui::Button::new(RichText::new("Install DLSS 5").font(t::plex_semibold(14.0)).color(t::BG))
+                    let install = egui::Button::new(RichText::new(lang::tr("Install DLSS 5", "安装 DLSS 5")).font(t::plex_semibold(14.0)).color(t::BG))
                         .fill(t::ACCENT)
                         .stroke(Stroke::NONE)
                         .corner_radius(CornerRadius::same(8))
@@ -3109,7 +3186,7 @@ impl eframe::App for App {
                     if ui.add_enabled(can_run, install).clicked() {
                         self.start(None);
                     }
-                    let remove = egui::Button::new(RichText::new("Remove").font(t::plex_medium(13.0)).color(t::TEXT_OFF))
+                    let remove = egui::Button::new(RichText::new(lang::tr("Remove", "卸载")).font(t::plex_medium(13.0)).color(t::TEXT_OFF))
                         .fill(Color32::TRANSPARENT)
                         .stroke(Stroke::new(1.0, t::BORDER_STRONG))
                         .corner_radius(CornerRadius::same(8))
@@ -3118,7 +3195,7 @@ impl eframe::App for App {
                         self.confirm_remove = true;
                     }
                     let diag = egui::Button::new(
-                        RichText::new("Diagnose").font(t::plex_medium(13.0)).color(t::TEXT_OFF),
+                        RichText::new(lang::tr("Diagnose", "诊断")).font(t::plex_medium(13.0)).color(t::TEXT_OFF),
                     )
                     .fill(Color32::TRANSPARENT)
                     .stroke(Stroke::new(1.0, t::BORDER_STRONG))
@@ -3127,7 +3204,7 @@ impl eframe::App for App {
                     if ui
                         .add_enabled(ok_status.is_some() && !self.running, diag)
                         .on_hover_text(
-                            "Reads this game's ReShade and feed logs and says why neural rendering is or is not running. Play the game first.",
+                            lang::tr("Reads this game's ReShade and feed logs and says why neural rendering is or is not running. Play the game first.", "读取此游戏的 ReShade 与 feed 日志，判断神经渲染是否在运行。请先运行游戏。"),
                         )
                         .clicked()
                     {
@@ -3138,7 +3215,7 @@ impl eframe::App for App {
                         .is_some_and(|s| s.api == game::Api::Vulkan);
                     if vulkan {
                         let vk_btn = egui::Button::new(
-                            RichText::new("Copy Vulkan Feeder kit")
+                            RichText::new(lang::tr("Copy Vulkan Feeder kit", "复制 Vulkan Feeder 套件"))
                                 .font(t::plex_medium(13.0))
                                 .color(t::TEXT_OFF),
                         )
@@ -3158,8 +3235,7 @@ impl eframe::App for App {
                                 let dir = exe.parent().unwrap().to_path_buf();
                                 match installer::copy_vulkan_feeder_kit(&dir) {
                                     Ok(files) => {
-                                        self.log.push(LogLine::Ok(format!(
-                                            "Vulkan kit: {}",
+                                        self.log.push(LogLine::Ok(crate::trfmt!("Vulkan kit: {}", "Vulkan 套件：{}",
                                             files.join(", ")
                                         )));
                                         self.inspect_resolved();
@@ -3189,19 +3265,19 @@ impl eframe::App for App {
                         let msg = if self.running || !self.progress_msg.is_empty() {
                             self.progress_msg.clone()
                         } else if !missing.is_empty() {
-                            format!("Incomplete: missing {}", missing.join(", "))
+                            crate::trfmt!("Incomplete: missing {}", "不完整：缺少 {}", missing.join(", "))
                         } else if !stale.is_empty() {
-                            format!("Update available: {}", stale.join("; "))
+                            crate::trfmt!("Update available: {}", "有更新：{}", stale.join("; "))
                         } else if complete {
-                            "Everything is in place.".to_owned()
+                            lang::tr("Everything is in place.", "一切就绪。").to_owned()
                         } else {
                             String::new()
                         };
-                        let color = if msg.starts_with("Failed")
-                            || msg.starts_with("Incomplete")
+                        let color = if msg.starts_with(lang::tr("Failed", "失败"))
+                            || msg.starts_with(lang::tr("Incomplete", "不完整"))
                         {
                             t::DANGER
-                        } else if msg.starts_with("Update available") {
+                        } else if msg.starts_with(lang::tr("Update available", "有更新")) {
                             t::WARN
                         } else {
                             t::ACCENT
@@ -3236,15 +3312,14 @@ impl eframe::App for App {
                     .filter(|l| matches!(l, LogLine::Ok(_) | LogLine::Step(_)))
                     .count();
                 let summary = if self.log.is_empty() {
-                    "Install log — empty".to_owned()
+                    lang::tr("Install log — empty", "安装日志 — 空").to_owned()
                 } else if !fails.is_empty() {
-                    format!(
-                        "Install log — {} error(s), {} step(s)",
+                    crate::trfmt!("Install log — {} error(s), {} step(s)", "安装日志 — {} 个错误，{} 个步骤",
                         fails.len(),
                         oks
                     )
                 } else {
-                    format!("Install log — {} line(s)", self.log.len())
+                    crate::trfmt!("Install log — {} line(s)", "安装日志 — {} 行", self.log.len())
                 };
                 ui.horizontal(|ui| {
                     let arrow = if self.log_expanded { "▾" } else { "▸" };
@@ -3313,28 +3388,28 @@ impl eframe::App for App {
                 }
 
                 ui.label(RichText::new(
-                    "After install, in game: press Home for the ReShade overlay, open the DLSS 5 Neural Rendering panel and enable it. \
+                    lang::tr("After install, in game: press Home for the ReShade overlay, open the DLSS 5 Neural Rendering panel and enable it. \
                      Keep MSAA/SSAA off. Check dlss5-feed.log next to the exe for 'feature ready'. \
                      Optional TRAA (LUMENITE: TRAA): keep it BELOW DLSS 5 Feed; Edge Detection=Geometric + Protect UI/text on — \
-                     re-run install to patch TRAA if UI still smears.")
+                     re-run install to patch TRAA if UI still smears.", "安装后，进入游戏：按 Home 打开 ReShade 覆盖层，打开 DLSS 5 Neural Rendering 面板并启用它。请关闭 MSAA/SSAA。查看 exe 旁的 dlss5-feed.log，确认出现 'feature ready'。可选的 TRAA（LUMENITE: TRAA）：请保持在 DLSS 5 Feed 之下；Edge Detection=Geometric + Protect UI/text 开启 —— 若 UI 仍糊，重新安装以修补 TRAA。"))
                     .font(t::plex(11.0)).color(t::TEXT_DIM));
                     });
             });
 
         // ── dialogs ───────────────────────────────────────────────
         if self.confirm_remove {
-            egui::Window::new(RichText::new("Remove DLSS 5 files").font(t::sora(14.0)))
+            egui::Window::new(RichText::new(lang::tr("Remove DLSS 5 files", "移除 DLSS 5 文件")).font(t::sora(14.0)))
                 .collapsible(false).resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ui.ctx(), |ui| {
-                    ui.label("Remove the DLSS 5 files from this game?
-
-Remove takes out what this tool added; ReShade stays.
-Remove incl. ReShade also deletes ReShade (dxgi.dll, ini/logs). Leftover shaders in reshade-shaders are kept; refused only if a foreign .addon64/.addon32 is still there. Never touches dgVoodoo d3d9.dll.");
+                    ui.label(lang::tr(
+                        "Remove the DLSS 5 files from this game?\n\nRemove takes out what this tool added; ReShade stays.\nRemove incl. ReShade also deletes ReShade (dxgi.dll, ini/logs). Leftover shaders in reshade-shaders are kept; refused only if a foreign .addon64/.addon32 is still there. Never touches dgVoodoo d3d9.dll.",
+                        "移除此游戏中的 DLSS 5 文件？\n\n「卸载」只移除本工具添加的内容，ReShade 会保留。\n「卸载（含 ReShade）」还会删除 ReShade（dxgi.dll、ini/logs）。reshade-shaders 里残留的着色器会保留；仅当还有外来的 .addon64/.addon32 时才会拒绝执行。绝不会动 dgVoodoo 的 d3d9.dll。",
+                    ));
                     ui.horizontal(|ui| {
-                        if ui.button("Remove").clicked() { self.confirm_remove = false; self.start(Some(false)); }
-                        if ui.button("Remove incl. ReShade").clicked() { self.confirm_remove = false; self.start(Some(true)); }
-                        if ui.button("Cancel").clicked() { self.confirm_remove = false; }
+                        if ui.button(lang::tr("Remove", "卸载")).clicked() { self.confirm_remove = false; self.start(Some(false)); }
+                        if ui.button(lang::tr("Remove incl. ReShade", "卸载（含 ReShade）")).clicked() { self.confirm_remove = false; self.start(Some(true)); }
+                        if ui.button(lang::tr("Cancel", "取消")).clicked() { self.confirm_remove = false; }
                     });
                 });
         }
@@ -3346,7 +3421,7 @@ Remove incl. ReShade also deletes ReShade (dxgi.dll, ini/logs). Leftover shaders
                 .show(ui.ctx(), |ui| {
                     ui.set_max_width(480.0);
                     ui.label(RichText::new(&err).color(t::DANGER));
-                    if ui.button("OK").clicked() {
+                    if ui.button(lang::tr("OK", "确定")).clicked() {
                         self.last_error = None;
                     }
                 });

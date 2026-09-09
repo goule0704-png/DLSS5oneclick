@@ -7,6 +7,7 @@
 //! `FullPath`. When it is absent, `NVSDK_NGX_D3D12_Init` answers
 //! `0xBAD00001` (FeatureNotSupported) on hardware that is otherwise fine —
 //! the failure two reporters hit on an RTX 4070 and an RTX 5080.
+use crate::lang;
 
 /// `(installed, full path)` from the NGX Core registry key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,7 +92,7 @@ fn version_key(v: &str) -> Option<(u32, u32)> {
 /// One line for a report: driver number, NGX Core state and where it points.
 pub fn describe() -> String {
     let driver = match crate::gpu::nvidia_driver() {
-        Some(v) => format!("NVIDIA driver {v}; "),
+        Some(v) => crate::trfmt!("NVIDIA driver {v}; ", "NVIDIA 驱动 {v}；"),
         None => String::new(),
     };
     format!("{driver}{}", describe_core())
@@ -100,20 +101,19 @@ pub fn describe() -> String {
 fn describe_core() -> String {
     match ngx_core() {
         Some(c) if c.installed && std::path::Path::new(&c.path).is_dir() => {
-            format!("NGX Core installed ({})", c.path)
+            crate::trfmt!("NGX Core installed ({})", "NGX Core 已安装（{}）", c.path)
         }
-        Some(c) if c.installed => format!(
-            "NGX Core registered but its folder is missing: {} — reinstall the NVIDIA driver \
-             (Custom install, keep every component)",
+        Some(c) if c.installed => crate::trfmt!("NGX Core registered but its folder is missing: {} — reinstall the NVIDIA driver \
+             (Custom install, keep every component)", "NGX Core 已注册但其文件夹缺失：{} —— 请重新安装 NVIDIA 驱动（自定义安装，保留所有组件）",
             c.path
         ),
-        Some(_) => "NGX Core is registered as NOT installed — reinstall the NVIDIA driver \
-             (Custom install, keep every component; NVCleanstall and \"minimal\" installs drop it)"
+        Some(_) => lang::tr("NGX Core is registered as NOT installed — reinstall the NVIDIA driver \
+             (Custom install, keep every component; NVCleanstall and \"minimal\" installs drop it)", "NGX Core 注册为未安装 —— 请重新安装 NVIDIA 驱动（自定义安装，保留所有组件；NVCleanstall 和「最小」安装会丢弃它）")
             .to_owned(),
-        None => "NGX Core is not registered on this system (no HKLM\\SOFTWARE\\NVIDIA \
+        None => lang::tr("NGX Core is not registered on this system (no HKLM\\SOFTWARE\\NVIDIA \
              Corporation\\Global\\NGXCore) — the NVIDIA driver was installed without it, so no \
              DLSS-based tool can start. Reinstall the driver with a Custom install and keep \
-             every component."
+             every component.", "此系统未注册 NGX Core（没有 HKLM\\SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore）—— NVIDIA 驱动在安装时没有包含它，因此任何基于 DLSS 的工具都无法启动。请用自定义安装重装驱动并保留所有组件。")
             .to_owned(),
     }
 }
@@ -178,14 +178,16 @@ pub fn file_version(_path: &std::path::Path) -> Option<String> {
 /// or NVIDIA's original.
 pub fn model_build(version: &str) -> &'static str {
     if version.to_ascii_uppercase().contains(".SF") {
-        "ShortFuse .SF build (adds Ada/Turing paths)"
+        lang::tr("ShortFuse .SF build (adds Ada/Turing paths)", "ShortFuse .SF 版本（新增 Ada/Turing 路径）")
     } else {
-        "NVIDIA original build"
+        lang::tr("NVIDIA original build", "NVIDIA 原版")
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// The two builds of the model differ only here: NVIDIA's reads
     /// `310,8,0,0`, ShortFuse's `310.8.SF.0`. Every other version field is
     /// identical, including `OriginalFilename` (`CL 38718415`).
@@ -193,10 +195,10 @@ mod tests {
     fn model_build_names_the_sf_repack() {
         assert_eq!(
             super::model_build("310.8.SF.0"),
-            "ShortFuse .SF build (adds Ada/Turing paths)"
+            lang::tr("ShortFuse .SF build (adds Ada/Turing paths)", "ShortFuse .SF 版本（新增 Ada/Turing 路径）")
         );
-        assert_eq!(super::model_build("310,8,0,0"), "NVIDIA original build");
-        assert_eq!(super::model_build("310.8.0.0"), "NVIDIA original build");
+        assert_eq!(super::model_build("310,8,0,0"), lang::tr("NVIDIA original build", "NVIDIA 原版"));
+        assert_eq!(super::model_build("310.8.0.0"), lang::tr("NVIDIA original build", "NVIDIA 原版"));
     }
 
     #[test]
