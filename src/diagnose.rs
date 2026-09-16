@@ -327,14 +327,13 @@ pub fn diagnose(st: &GameStatus) -> Vec<Finding> {
         // count at 1, 60 and 600; reaching 600 means the pass held.
         let held = rs.contains("evaluation succeeded (count=600");
         if worksets >= 2 || (created >= 6 && !held) {
-            out.push(bad(format!(
-                "{}", crate::trfmt!("The neural pass is being torn down and re-created instead of running: the \
+            out.push(bad(crate::trfmt!("The neural pass is being torn down and re-created instead of running: the \
                  feature was created {created} times and the add-on opened {} worksets in this \
                  session. Each re-creation resets the model and costs GPU time, and almost no \
                  frame is evaluated — FPS drops, picture unchanged. This happens in games that \
                  drive DLSS from several threads or several NGX features (Cyberpunk 2077 with \
                  Ray Reconstruction, #95). Try Model Resolution 100% first; if it persists, \
-                 the OptiScaler engine runs the pass inside the upscaler and is not affected.", "神经通道正在被反复销毁重建，而不是真正在跑：本会话里该特性被创建了 {created} 次，附加组件打开了 {} 个 workset。每次重建都会重置模型并消耗 GPU 时间，几乎没有帧被评估 —— FPS 下降、画面不变。用多个线程或多个 NGX 特性驱动 DLSS 的游戏会出现这种情况（赛博朋克 2077 开启光线重建，#95）。请先把 Model Resolution 设为 100%；若仍然如此，OptiScaler 引擎是在上采样器内部运行该通道的，不受影响。", worksets + 1))));
+                 the OptiScaler engine runs the pass inside the upscaler and is not affected.", "神经通道正在被反复销毁重建，而不是真正在跑：本会话里该特性被创建了 {created} 次，附加组件打开了 {} 个 workset。每次重建都会重置模型并消耗 GPU 时间，几乎没有帧被评估 —— FPS 下降、画面不变。用多个线程或多个 NGX 特性驱动 DLSS 的游戏会出现这种情况（赛博朋克 2077 开启光线重建，#95）。请先把 Model Resolution 设为 100%；若仍然如此，OptiScaler 引擎是在上采样器内部运行该通道的，不受影响。", worksets + 1)));
         } else {
             out.push(ok(
                 lang::tr("Neural rendering ran: the add-on evaluated the DLSS 5 model on real frames. If the \

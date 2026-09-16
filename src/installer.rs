@@ -564,8 +564,7 @@ fn step_opti(
             (Some(a), Some(b)) if &a == b => {
                 // Current, but the ticks may have changed since — apply them.
                 patch_opti_ini(st, d)?;
-                return Ok(vec![format!(
-                    "{}", crate::trfmt!("OptiScaler already current ({a}), settings applied", "OptiScaler 已是最新（{a}），设置已应用"))]);
+                return Ok(vec![crate::trfmt!("OptiScaler already current ({a}), settings applied", "OptiScaler 已是最新（{a}），设置已应用")]);
             }
             (Some(a), Some(b)) => progress(0, &crate::trfmt!("OptiScaler {a} is out, {b} available", "OptiScaler {a} 已过时，{b} 可用")),
             (Some(_), None) => {
@@ -1862,7 +1861,7 @@ fn step_feeder(
         && host_current
         && same_size(&mut zip, &addon, &d.join(addon_name))
     {
-        return Ok(vec![format!("{}", crate::trfmt!("DLSS5-Feeder already current ({tag}{note})", "DLSS5-Feeder 已是最新（{tag}{note}）"))]);
+        return Ok(vec![crate::trfmt!("DLSS5-Feeder already current ({tag}{note})", "DLSS5-Feeder 已是最新（{tag}{note}）")]);
     }
     net::extract_member(&mut zip, &addon, &d.join(addon_name))?;
     fs::write(d.join(game::FEEDER_MARKER), tag.as_bytes())?;
@@ -2080,7 +2079,7 @@ fn step_dlss5(
                 if let Some(m) = marker {
                     let _ = fs::write(cdir.join(m), tag.as_bytes());
                 }
-                installed.push(format!("{}", crate::trfmt!("{fname} already current ({tag})", "{fname} 已是最新（{tag}）")));
+                installed.push(crate::trfmt!("{fname} already current ({tag})", "{fname} 已是最新（{tag}）"));
                 continue;
             }
         }

@@ -36,7 +36,7 @@ pub fn tr<'a>(en: &'a str, zh: &'a str) -> &'a str {
 /// Like [`tr`], but for format templates: both sides are formatted with the
 /// same arguments and the active language's result is returned (owned).
 /// Rust's `format!`/`bail!`/`println!` macros require a literal format
-/// string, so use this inside them as `format!("{}", trfmt!("...{x}...", "...{x}...", x))`.
+/// string, so use this inside them as `trfmt!("...{x}...", "...{x}...", x)`.
 #[macro_export]
 macro_rules! trfmt {
     ($en:literal, $zh:literal $(, $arg:expr)* $(,)?) => {{
