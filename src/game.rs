@@ -24,10 +24,35 @@ pub const DLSS_DLL: &str = "nvngx_dlss.dll";
 pub const LUMENITE_KERNEL_FX: &str = "lumenite_Kernel.fx";
 pub const LUMENITE_BLUENOISE: &str = "lumenite_bluenoise256.png";
 pub const BRIDGE_ADDON: &str = "dlss5-bridge.addon64";
+/// mavismmg/MFGAdaUnlock-RenoDx: a ReShade add-on that lifts NVIDIA's RTX 50
+/// gate on multi-frame generation and corrects the temporal midpoint, entirely
+/// in mapped memory. One file, MIT, nothing in the game folder modified.
+pub const MFG_ADDON: &str = "renodx-mfgunlock.addon64";
+/// NVIDIA's frame-generation runtime. The MFG add-on validates this provider by
+/// build and refuses anything it does not know, so the version beside the game
+/// decides whether the unlock does anything at all.
+pub const DLSSG_DLL: &str = "nvngx_dlssg.dll";
+pub const DLSSG_MARKER: &str = "nvngx_dlssg.dll.dlss5oneclick";
+/// The game's own provider, moved aside before ours goes in. Never deleted:
+/// Remove puts it back.
+pub const DLSSG_BACKUP: &str = "nvngx_dlssg.dll.original";
+/// Sidecar for a dgVoodoo `d3d9.dll` this tool downloaded. Remove used to leave
+/// dgVoodoo behind on every DX9 game, so a game that would not start kept not
+/// starting after Remove and there was nothing saying which file to delete (#91).
+/// A second line, `conf-ours`, marks a `dgVoodoo.conf` this tool created rather
+/// than merged into someone's existing one.
+pub const DGVOODOO_MARKER: &str = "d3d9.dll.dlss5oneclick";
+pub const DGVOODOO_CONF: &str = "dgVoodoo.conf";
 /// matiasLombo's neural-upstream add-on. The name is not ours to choose: the
 /// NGX snippet gates feature creation on the calling module's path containing
 /// `nvngx.dll`, and under any other name it returns 0xBAD00002 and does nothing.
 pub const UPSTREAM_ADDON: &str = "nvngx.dll.addon64";
+/// kibblerz's DLSS5 ReShade AIO: its own NR + super resolution + frame
+/// generation pipeline as one ReShade add-on, for games with no DLSS of their
+/// own. Takes the place of the Feeder and the RenoDX add-on together.
+pub const AIO_ADDON: &str = "standalone-dlssnr.addon64";
+/// Files this tool wrote for an AIO install, one path per line, tag in the header.
+pub const AIO_MANIFEST: &str = ".dlss5oneclick-aio-manifest";
 /// Files this tool wrote for an OptiScaler install, one path per line.
 pub const OPTI_MANIFEST: &str = ".dlss5oneclick-optiscaler-manifest";
 /// Sidecar written next to an `nvngx_dlss.dll` this tool placed, so it is never mistaken for the game's own.
@@ -36,6 +61,11 @@ pub const DLSS_MARKER: &str = "nvngx_dlss.dll.dlss5oneclick";
 /// tool placed, so Install can tell "ours and stale" from "the user's own".
 pub const DLSSNR_MARKER: &str = "nvngx_dlssnr.dll.dlss5oneclick";
 pub const RESHADE_MARKER: &str = "dxgi.dll.dlss5oneclick";
+/// The DLSS 5 add-on release tag this tool placed. Every build carries the same
+/// embedded FileVersion (0.2026.0828.0517 in 4.55 and 4.70 alike), so the
+/// Feeder's host names them all "v4.6 engine" and warns about a combination the
+/// classic build is not part of. The tag is the only way to tell them apart.
+pub const DLSS5_ADDON_MARKER: &str = "renodx-dlss5.addon64.dlss5oneclick";
 /// The DLSS5-Feeder release tag this tool placed, so a stale install can be
 /// spotted without downloading the zip to compare sizes.
 pub const FEEDER_MARKER: &str = "dlss5-feed.dlss5oneclick";
@@ -90,6 +120,25 @@ pub fn is_reshade_dll(path: &Path) -> bool {
         Ok(bytes) => is_reshade_image(&bytes),
         Err(_) => false,
     }
+}
+
+/// True when `dinput8.dll` is really REFramework rather than something else
+/// wearing that name.
+///
+/// `dinput8.dll` is a proxy slot, not a product: REFramework uses it, and so do
+/// the RTX 20/30 frame-generation mods (`dlssg_for_sm75` and `dlssg_for_sm86`
+/// ship `dinput8.dll` and `version.dll` to intercept nvapi and spoof the GPU
+/// architecture). Testing only for the file's presence meant an RE Engine game
+/// with one of those installed looked like it already had REFramework, so the
+/// install skipped it — and RE Engine games crash under ReShade without it.
+pub fn is_reframework_dll(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    let has = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+    // praydog's own name and the project's are both in every build; the
+    // frame-generation proxies carry neither.
+    has(b"REFramework") || has(b"praydog")
 }
 
 /// OptiScaler's own `dxgi.dll` carries the string `ReShade` six times, because
@@ -150,6 +199,68 @@ impl Api {
     }
 }
 
+/// The head of a PE file through the end of the section that holds its
+/// import directory — everything `pe_imports` and `pe_import_fns` index,
+/// as a prefix so their file offsets stay valid. Crimson Desert's exe is
+/// 358 MB and reading all of it, then twelve engine DLLs the same way,
+/// froze the window for a minute on clicking the game; the import section
+/// ends a few tens of MB in.
+fn pe_import_prefix(exe: &Path) -> Option<Vec<u8>> {
+    let mut f = fs::File::open(exe).ok()?;
+    let len = f.metadata().ok()?.len() as usize;
+    let mut head = vec![0u8; len.min(64 * 1024)];
+    f.read_exact(&mut head).ok()?;
+    let rd32 = |o: usize| -> Option<u32> {
+        head.get(o..o + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let rd16 =
+        |o: usize| -> Option<u16> { head.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]])) };
+    let end = (|| -> Option<usize> {
+        if head.get(..2)? != b"MZ" {
+            return None;
+        }
+        let pe = rd32(0x3C)? as usize;
+        if head.get(pe..pe + 4)? != b"PE\0\0" {
+            return None;
+        }
+        let coff = pe + 4;
+        let nsec = rd16(coff + 2)? as usize;
+        let opt_size = rd16(coff + 16)? as usize;
+        let opt = coff + 20;
+        let dd_off = match rd16(opt)? {
+            0x20B => 112,
+            0x10B => 96,
+            _ => return None,
+        };
+        let import_rva = rd32(opt + dd_off + 8)? as usize;
+        if import_rva == 0 {
+            return Some(head.len());
+        }
+        let sec = opt + opt_size;
+        (0..nsec).find_map(|i| {
+            let s = sec + i * 40;
+            let (va, size, raw, raw_size) = (
+                rd32(s + 12)? as usize,
+                rd32(s + 16)? as usize,
+                rd32(s + 20)? as usize,
+                rd32(s + 8)? as usize,
+            );
+            (import_rva >= va && import_rva < va + size).then_some(raw + raw_size.max(size))
+        })
+    })()?;
+    let end = end.min(len);
+    if end <= head.len() {
+        head.truncate(end);
+        return Some(head);
+    }
+    let mut data = head;
+    data.resize(end, 0);
+    f.seek(SeekFrom::Start(64 * 1024)).ok()?;
+    f.read_exact(&mut data[64 * 1024..]).ok()?;
+    Some(data)
+}
+
 /// Lower-cased DLL names from the exe's static import table. Empty on any parse problem.
 /// Every function name the PE imports from `dll` (lowercased).
 ///
@@ -158,7 +269,7 @@ impl Api {
 /// alone and render with something far newer, which is how RDR2 read as
 /// DirectX 9 (#53). A real D3D9 renderer calls `Direct3DCreate9`.
 pub fn pe_import_fns(exe: &Path, dll: &str) -> Vec<String> {
-    let Ok(data) = fs::read(exe) else {
+    let Some(data) = pe_import_prefix(exe) else {
         return vec![];
     };
     let rd32 = |o: usize| -> Option<u32> {
@@ -265,7 +376,7 @@ pub fn pe_import_fns(exe: &Path, dll: &str) -> Vec<String> {
 }
 
 pub fn pe_imports(exe: &Path) -> Vec<String> {
-    let Ok(data) = fs::read(exe) else {
+    let Some(data) = pe_import_prefix(exe) else {
         return vec![];
     };
     let rd32 = |o: usize| -> Option<u32> {
@@ -506,7 +617,21 @@ fn dll_mentions_dgvoodoo(b: &[u8]) -> bool {
 /// ReShade add-on injection is exactly what they look for: kicks at best, bans
 /// at worst. Verified file names: EAC `EasyAntiCheat[_EOS]/EasyAntiCheat_EOS_Setup.exe`,
 /// BattlEye `BattlEye/BEService_x64.exe`, `Install_BattlEye.bat`, `*_BE.exe`,
-/// GameGuard `tools/GGSetup.exe` or a `GameGuard` folder.
+/// GameGuard `tools/GGSetup.exe` or a `GameGuard` folder, EA Javelin an
+/// `EAAntiCheat` folder or `EAAntiCheat.GameServiceLauncher.exe/.dll` beside
+/// the exe.
+/// A folder with thousands of entries is an asset store (extracted game
+/// archives, a texture dump), never where a DLL, an anti-cheat, or an exe
+/// lives. Crimson Desert's bin64 carried 318,000 files in two such folders
+/// and every walk here crossed them; clicking the game froze the window for
+/// a minute. Counting stops at the cap, so the check itself stays cheap.
+pub fn huge_dir(d: &Path) -> bool {
+    const CAP: usize = 2000;
+    fs::read_dir(d)
+        .map(|rd| rd.take(CAP + 1).count() > CAP)
+        .unwrap_or(false)
+}
+
 pub fn detect_anticheat(game_dir: &Path) -> Option<&'static str> {
     fn walk(d: &Path, depth: u8) -> Option<&'static str> {
         let rd = fs::read_dir(d).ok()?;
@@ -527,7 +652,13 @@ pub fn detect_anticheat(game_dir: &Path) -> Option<&'static str> {
                 if n == "gameguard" {
                     return Some("GameGuard");
                 }
-                if depth > 0 {
+                // EA Javelin is kernel-mode and, by EA's own description, also
+                // guards single-player against tampering — so it is in play even
+                // in a game nobody is competing in (#21).
+                if n == "eaanticheat" {
+                    return Some("EA Javelin Anticheat");
+                }
+                if depth > 0 && !huge_dir(&p) {
                     if let Some(hit) = walk(&p, depth - 1) {
                         return Some(hit);
                     }
@@ -542,6 +673,9 @@ pub fn detect_anticheat(game_dir: &Path) -> Option<&'static str> {
                 }
                 if n == "ggsetup.exe" || n == "gameguard.des" {
                     return Some("GameGuard");
+                }
+                if n.starts_with("eaanticheat") {
+                    return Some("EA Javelin Anticheat");
                 }
             }
         }
@@ -560,6 +694,15 @@ pub fn known_anticheat_exe(exe: &Path) -> Option<&'static str> {
         .to_ascii_lowercase();
     match n.as_str() {
         "overwatch.exe" => Some(lang::tr("Blizzard anti-cheat (Overwatch)", "暴雪反作弊（Overwatch）")),
+        // Retail WoW has blocked a dxgi.dll override outright (11.1.7.61965,
+        // and again in 11.2.0: "Your 3D accelerator card is not supported"),
+        // and Blizzard's position is that injecting into the render chain is
+        // against its terms whether or not it is blocked that week. A 3.3.5a
+        // private-server client carries the same exe name and its own rules,
+        // so the warning is the same and the override tick is right there (#45).
+        "wow.exe" | "wowclassic.exe" => {
+            Some(lang::tr("Blizzard Warden (World of Warcraft)", "暴雪 Warden 反作弊（魔兽世界）"))
+        }
         "valorant.exe" | "valorant-win64-shipping.exe" => Some("Riot Vanguard"),
         "leagueclient.exe" | "league of legends.exe" => Some("Riot Vanguard"),
         _ => None,
@@ -588,13 +731,15 @@ pub fn game_ships_dlss(game_dir: &Path) -> bool {
                 if n == DLSS_DLL && !p.with_file_name(DLSS_MARKER).is_file() {
                     return true;
                 }
-                if n == "nvngx_dlssg.dll"
+                // A frame-generation runtime this tool placed for the AIO is
+                // not the game's either.
+                if (n == DLSSG_DLL && !p.with_file_name(DLSSG_MARKER).is_file())
                     || n == "nvngx_dlssd.dll"
                     || (n.starts_with("sl.") && n.ends_with(".dll"))
                 {
                     return true;
                 }
-            } else if depth > 0 && p.is_dir() && walk(&p, depth - 1) {
+            } else if depth > 0 && p.is_dir() && !huge_dir(&p) && walk(&p, depth - 1) {
                 return true;
             }
         }
@@ -695,7 +840,12 @@ pub fn rt_likely(game_dir: &Path) -> bool {
             {
                 return true;
             }
-            if depth > 0 && p.is_dir() && !n.starts_with('.') && walk_names(&p, depth - 1) {
+            if depth > 0
+                && p.is_dir()
+                && !n.starts_with('.')
+                && !huge_dir(&p)
+                && walk_names(&p, depth - 1)
+            {
                 return true;
             }
         }
@@ -752,6 +902,8 @@ pub struct GameStatus {
     pub dlss: bool,
     /// What the folder scan said, before any override.
     pub mode_detected: Mode,
+    /// What the import table said, before any `--api` override.
+    pub api_detected: Api,
     /// 32-bit only: `host64\dlss5-feed-host64.exe` and a 64-bit ReShade beside it.
     pub host_exe: bool,
     pub host_reshade: bool,
@@ -760,6 +912,10 @@ pub struct GameStatus {
     pub reframework: bool,
     /// matiasLombo's neural-upstream add-on is in the folder.
     pub upstream: bool,
+    /// kibblerz's standalone AIO add-on is in the folder.
+    pub aio: bool,
+    /// The RTX 40 multi-frame-generation add-on is already beside the game.
+    pub mfg: bool,
     /// Unreal-style layout / Shipping exe (heuristic).
     pub unreal_likely: bool,
     /// UnityPlayer.dll present (heuristic).
@@ -800,11 +956,14 @@ pub(crate) fn stub_status(mode: Mode, api: Api) -> GameStatus {
         dlssnr: false,
         dlss: false,
         mode_detected: mode,
+        api_detected: api,
         host_exe: false,
         host_reshade: false,
         re_engine: false,
         reframework: false,
         upstream: false,
+        aio: false,
+        mfg: false,
         unreal_likely: false,
         unity_likely: false,
         rt_likely: false,
@@ -834,6 +993,29 @@ pub fn set_mode_override(m: Option<Mode>) {
         Some(Mode::Feeder) => std::env::set_var(MODE_ENV, "feeder"),
         Some(Mode::Native) => std::env::set_var(MODE_ENV, "native"),
         None => std::env::remove_var(MODE_ENV),
+    }
+}
+
+/// `dx11` or `dx12`: override the graphics-API detection. Detection reads
+/// the import table and the engine DLLs beside the exe, and says "unknown,
+/// assuming DX12" when neither speaks; a wrong answer picks the wrong route
+/// (the DX11 bridge, the D3D12-only frame-generation gate).
+pub const API_ENV: &str = "DLSS5ONECLICK_API";
+
+pub fn api_override() -> Option<Api> {
+    match std::env::var(API_ENV).ok()?.to_ascii_lowercase().as_str() {
+        "dx11" | "d3d11" => Some(Api::Dx11),
+        "dx12" | "d3d12" => Some(Api::Dx12),
+        _ => None,
+    }
+}
+
+/// GUI dropdown / `--api=`: same switch as the environment variable.
+pub fn set_api_override(a: Option<Api>) {
+    match a {
+        Some(Api::Dx11) => std::env::set_var(API_ENV, "dx11"),
+        Some(Api::Dx12) => std::env::set_var(API_ENV, "dx12"),
+        _ => std::env::remove_var(API_ENV),
     }
 }
 
@@ -909,6 +1091,11 @@ impl GameStatus {
         self.mode == Mode::Native && self.api == Api::Dx11
     }
     pub fn complete(&self) -> bool {
+        // The AIO is its own consumer on either kind of game: ReShade, the
+        // add-on, the model, and NVIDIA's DLSS runtime beside it.
+        if self.aio && !self.opti {
+            return self.reshade && self.dlssnr && self.dlss;
+        }
         match self.mode {
             Mode::Feeder => {
                 self.reshade
@@ -933,11 +1120,60 @@ impl GameStatus {
     }
 }
 
+/// The `Content` folder of a Game Pass / Microsoft Store install: the one with
+/// `MicrosoftGame.config`, at the exe's folder or a few levels up.
+pub fn game_pass_content_dir(d: &Path) -> Option<PathBuf> {
+    d.ancestors()
+        .take(4)
+        .find(|a| a.join("MicrosoftGame.config").is_file())
+        .map(Path::to_path_buf)
+}
+
+/// Whether a Game Pass install ships NVIDIA's DLSS runtime anywhere under its
+/// `Content` folder. The exe itself may be unreadable, but the DLLs are not.
+fn game_pass_ships_dlss(content: &Path) -> bool {
+    fn walk(d: &Path, depth: u8) -> bool {
+        let Ok(rd) = fs::read_dir(d) else {
+            return false;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_file() {
+                if p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.eq_ignore_ascii_case(DLSS_DLL))
+                {
+                    return true;
+                }
+            } else if depth > 0 && p.is_dir() && !huge_dir(&p) && walk(&p, depth - 1) {
+                return true;
+            }
+        }
+        false
+    }
+    walk(content, 4)
+}
+
 pub fn inspect(exe: &Path) -> Result<GameStatus> {
     if !exe.is_file() {
         bail!("{}", crate::trfmt!("game executable not found: {}", "游戏可执行文件未找到：{}", exe.display()));
     }
     let d = exe.parent().context("exe has no parent directory")?;
+    // Game Pass installs are protected: the real exe is often unreadable, the
+    // folder refuses writes, and a dxgi.dll beside a packaged exe is never
+    // loaded. Every one of them read as "no DLSS, Feeder path" here, because
+    // what the scan finds is gamelaunchhelper.exe, a stub with nothing in it.
+    if let Some(content) = game_pass_content_dir(d) {
+        let native = if game_pass_ships_dlss(&content) {
+            "The game itself ships DLSS (nvngx_dlss.dll is in its folder), so it supports DLSS natively; only this install cannot be modified."
+        } else {
+            "No nvngx_dlss.dll anywhere in its folder, so this game has no DLSS of its own either."
+        };
+        bail!(
+            "Game Pass / Microsoft Store copy ({}): Windows protects these installs — the              executable is locked, the folder refuses writes, and a dxgi.dll placed beside a              packaged exe is never loaded — so DLSS 5 cannot be installed on this copy. The same              game from Steam, Epic or GOG works. {native}",
+            content.display()
+        );
+    }
     let bitness = exe_bitness(exe)?;
     let shaders = d.join("reshade-shaders").join("Shaders");
     let textures = d.join("reshade-shaders").join("Textures");
@@ -970,7 +1206,8 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
                 .into(),
         );
     }
-    let api = detect_api(exe);
+    let api_detected = detect_api(exe);
+    let api = api_override().unwrap_or(api_detected);
     // Plain D3D9 (Gothic 3, Aion, etc.): ReShade is dxgi.dll here, which a
     // D3D9 process never loads. Install adds official dgVoodoo 2.87.3 so DX9
     // is not a hard refuse. A foreign non-dgVoodoo d3d9.dll still blocks above.
@@ -1013,6 +1250,8 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         bridge: d.join(BRIDGE_ADDON).is_file() || d.join("dlss5-dx11-bridge.addon64").is_file(),
         opti: d.join(OPTI_MANIFEST).is_file(),
         upstream: d.join(UPSTREAM_ADDON).is_file(),
+        aio: d.join(AIO_ADDON).is_file(),
+        mfg: d.join(MFG_ADDON).is_file(),
         gpu,
         exe: exe.to_path_buf(),
         bitness,
@@ -1025,10 +1264,11 @@ pub fn inspect(exe: &Path) -> Result<GameStatus> {
         dlssnr: cdir.join(DLSSNR_DLL).is_file(),
         dlss: cdir.join(DLSS_DLL).is_file(),
         mode_detected,
+        api_detected,
         host_exe: is32 && cdir.join(HOST_EXE).is_file(),
         host_reshade: is32 && is_reshade_dll(&cdir.join(RESHADE_PROXY)),
         re_engine: d.join(RE_ENGINE_PAK).is_file(),
-        reframework: d.join(REFRAMEWORK_DLL).is_file(),
+        reframework: is_reframework_dll(&d.join(REFRAMEWORK_DLL)),
         unreal_likely: unreal_likely(exe, d),
         unity_likely: unity_likely(d),
         rt_likely: rt_likely(d),
@@ -1087,9 +1327,15 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
                 // which is an ordinary PE (#16). Anything that is not really a
                 // PE is dropped by the bitness read further down, so widening
                 // the extension costs nothing.
+                let name = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
                 if p.extension()
                     .is_some_and(|x| x.eq_ignore_ascii_case("exe") || x.eq_ignore_ascii_case("bin"))
                     && p.is_file()
+                    && name != HOST_EXE.to_ascii_lowercase()
                 {
                     found.push(p);
                 }
@@ -1115,6 +1361,12 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
                 | "commonredist"
                 | "redist"
                 | "redistributables"
+                // Our own 32-bit helper lives here. It is a 64-bit PE, so the
+                // "prefer 64-bit" rule ranked it above the real 32-bit game and
+                // the next Install treated the game as 64-bit — writing a
+                // 64-bit ReShade into a 32-bit game's folder, which the game
+                // cannot load, so the Home key did nothing (#69).
+                | HOST_DIR
         ) || n.ends_with("_data")
     };
     // Down to four levels, which is where games actually put the launch exe:
@@ -1130,7 +1382,7 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
         for sub in rd
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.is_dir() && !skip(p))
+            .filter(|p| p.is_dir() && !skip(p) && !huge_dir(p))
         {
             out(&sub);
             walk(&sub, depth - 1, skip, out);
@@ -1166,15 +1418,18 @@ pub fn find_game_exes(dir: &Path) -> Vec<PathBuf> {
                 score += 1_000_000_000;
             }
             score += size.min(400_000_000);
+            // A 32-bit exe sitting beside a 64-bit one is usually a tool, so a
+            // 64-bit candidate still outranks every 32-bit one. It used to
+            // *delete* them, which hid the real game: Prince of Persia: The Two
+            // Thrones keeps a 64-bit launcher named after the folder next to the
+            // 32-bit game, and the game could not be chosen at all (#89). They
+            // are ranked, not discarded, so the exe picker still offers them.
+            if bits == 64 {
+                score += 8_000_000_000;
+            }
             Some((bits, score, p))
         })
         .collect();
-    // A 32-bit exe sitting beside a 64-bit one is a tool, not the game, so
-    // 64-bit wins whenever one exists. Only a folder with nothing 64-bit in it
-    // (Max Payne, #17) falls back to 32-bit.
-    if scored.iter().any(|s| s.0 == 64) {
-        scored.retain(|s| s.0 == 64);
-    }
     scored.sort_by_key(|s| std::cmp::Reverse(s.1));
     scored.into_iter().map(|(_, _, p)| p).collect()
 }
@@ -1267,6 +1522,7 @@ pub fn shaders_missing(game_dir: &Path) -> bool {
 pub fn installed_by_tool(dir: &Path) -> bool {
     [
         OPTI_MANIFEST,
+        AIO_MANIFEST,
         RENODX_MANIFEST,
         REFRAMEWORK_MARKER,
         DLSS_MARKER,
@@ -1519,6 +1775,26 @@ mod tests {
     /// Max Payne is a 32-bit game and has no 64-bit exe at all; picking the
     /// folder used to find nothing, so it only worked when the exe was chosen
     /// by hand (#17). The feeder drives 32-bit games through its host64 helper.
+    /// After one install a 32-bit game folder contains host64\dlss5-feed-host64.exe,
+    /// which is a 64-bit PE. The scan ranked it above the real 32-bit game exe,
+    /// so the next Install wrote a 64-bit ReShade into a 32-bit game's folder and
+    /// the game silently stopped loading it (#69).
+    #[test]
+    fn our_own_host_helper_is_never_the_game() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("Grand Theft Auto IV");
+        let host = d.join(HOST_DIR);
+        fs::create_dir_all(&host).unwrap();
+        let game = make_pe(&d.join("GTAIV.exe"), PE_X86);
+        make_pe(&host.join(HOST_EXE), PE_X64);
+
+        let found = find_game_exes(&d);
+        assert_eq!(found, vec![game.clone()], "{found:?}");
+        let (exe, _) = resolve_target(&d).unwrap();
+        assert_eq!(exe, game);
+        assert_eq!(exe_bitness(&exe).unwrap(), 32);
+    }
+
     #[test]
     fn find_game_exes_falls_back_to_32bit_when_no_64bit_exists() {
         let t = tempfile::tempdir().unwrap();
@@ -1526,6 +1802,23 @@ mod tests {
         fs::create_dir_all(&d).unwrap();
         make_pe(&d.join("maxpayne.exe"), PE_X86);
         assert_eq!(find_game_exes(&d), vec![d.join("maxpayne.exe")]);
+    }
+
+    /// Prince of Persia: The Two Thrones ships a 64-bit launcher named after
+    /// the folder beside the 32-bit game. The 64-bit one still wins by default,
+    /// but the game must stay in the list or it cannot be chosen at all (#89).
+    #[test]
+    fn a_thirty_two_bit_game_stays_listed_behind_a_64_bit_launcher() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("Prince of Persia Two Thrones");
+        fs::create_dir_all(&d).unwrap();
+        let launcher = d.join("PrinceOfPersia.exe");
+        let game = d.join("PoP3.exe");
+        make_pe(&launcher, PE_X64);
+        make_pe(&game, PE_X86);
+        let found = find_game_exes(&d);
+        assert_eq!(found.first(), Some(&launcher), "{found:?}");
+        assert!(found.contains(&game), "{found:?}");
     }
 
     /// A named .exe is an instruction. Searching outward from it and picking a
@@ -1562,6 +1855,66 @@ mod tests {
         assert!(all.contains(&launcher));
     }
 
+    /// Madden NFL 27 ships EA Javelin, which is kernel-mode and — by EA's own
+    /// description — guards single-player too. NGX then refuses to initialise in
+    /// the game's process (0xBAD00001 on the capability query itself), and the
+    /// tool said nothing about it, so the reporter spent days on reinstalls (#21).
+    #[test]
+    fn ea_javelin_is_detected_by_its_launcher_and_folder() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        assert_eq!(detect_anticheat(d), None);
+
+        fs::write(d.join("EAAntiCheat.GameServiceLauncher.exe"), b"x").unwrap();
+        assert_eq!(detect_anticheat(d), Some("EA Javelin Anticheat"));
+
+        let t2 = tempfile::tempdir().unwrap();
+        fs::create_dir_all(t2.path().join("EAAntiCheat")).unwrap();
+        assert_eq!(detect_anticheat(t2.path()), Some("EA Javelin Anticheat"));
+    }
+
+    /// Blizzard blocked a dxgi.dll override in retail WoW twice in 2025 and
+    /// treats render-chain injection as a terms violation. Installing into it
+    /// silently is the one outcome worth refusing outright (#45).
+    #[test]
+    fn world_of_warcraft_is_named_before_anything_is_installed() {
+        for n in ["Wow.exe", "WowClassic.exe", "wow.exe"] {
+            assert_eq!(
+                known_anticheat_exe(Path::new(n)),
+                Some("Blizzard Warden (World of Warcraft)"),
+                "{n}"
+            );
+        }
+        assert_eq!(known_anticheat_exe(Path::new("wowzers.exe")), None);
+    }
+
+    /// dinput8.dll is a proxy slot, not a product. The RTX 20/30 frame-gen mods
+    /// ship their own, and an RE Engine game with one installed looked like it
+    /// already had REFramework — so Install skipped it, and RE Engine games
+    /// crash under ReShade without it.
+    #[test]
+    fn someone_elses_dinput8_is_not_reframework() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let dll = d.join(REFRAMEWORK_DLL);
+        assert!(!is_reframework_dll(&dll), "missing file is not REFramework");
+
+        // What the frame-generation proxies look like: nvapi interception, no
+        // mention of REFramework or its author.
+        fs::write(
+            &dll,
+            b"MZ\x00\x00nvapi_QueryInterface\x00sm_75\x00NVAPI_GPU_ARCHITECTURE_AD100\x00",
+        )
+        .unwrap();
+        assert!(
+            !is_reframework_dll(&dll),
+            "a frame-gen proxy is not REFramework"
+        );
+
+        fs::write(&dll, b"MZ\x00\x00REFramework\x00praydog\x00").unwrap();
+        assert!(is_reframework_dll(&dll));
+    }
+
     #[test]
     fn find_game_exes_skips_helpers_and_prefers_folder_name() {
         let t = tempfile::tempdir().unwrap();
@@ -1571,10 +1924,12 @@ mod tests {
         make_pe(&d.join("tool32.exe"), PE_X86);
         make_pe(&d.join("Fell & Sell.exe"), PE_X64);
         let c = find_game_exes(&d);
-        assert_eq!(c, vec![d.join("Fell & Sell.exe")]);
-        let (exe, all) = resolve_target(&d).unwrap();
+        // The helper is dropped by name; the 32-bit tool is ranked last rather
+        // than hidden, because hiding every 32-bit exe hid real games (#89).
+        assert_eq!(c.first(), Some(&d.join("Fell & Sell.exe")), "{c:?}");
+        assert!(!c.contains(&d.join("UnityCrashHandler64.exe")), "{c:?}");
+        let (exe, _all) = resolve_target(&d).unwrap();
         assert_eq!(exe, d.join("Fell & Sell.exe"));
-        assert_eq!(all.len(), 1);
     }
 
     /// Satisfactory (Epic): the launcher names FactoryGameEGS.exe in the root,
@@ -2091,5 +2446,51 @@ mod tests {
         fs::create_dir_all(&win64).unwrap();
         let exe = make_pe(&win64.join("MyGame-Win64-Shipping.exe"), PE_X64);
         assert!(unreal_likely(&exe, &win64));
+    }
+
+    /// Game Pass installs are protected end to end; the scan finds the
+    /// gamelaunchhelper.exe stub and read every one as "no DLSS, Feeder path".
+    /// A MicrosoftGame.config above the exe is the tell, and whether the
+    /// game ships DLSS is read from its folder, not from the locked exe.
+    #[test]
+    fn game_pass_copies_are_refused_with_the_native_dlss_verdict() {
+        let t = tempfile::tempdir().unwrap();
+        let content = t.path().join("Content");
+        fs::create_dir_all(content.join("Game").join("Binaries")).unwrap();
+        fs::write(content.join("MicrosoftGame.config"), "<Game/>").unwrap();
+        let exe = testutil::make_pe(&content.join("gamelaunchhelper.exe"), PE_X64);
+        let err = inspect(&exe).unwrap_err().to_string();
+        assert!(err.contains("Game Pass"), "{err}");
+        assert!(err.contains("no DLSS of its own"), "{err}");
+
+        fs::write(content.join("Game").join("Binaries").join(DLSS_DLL), b"x").unwrap();
+        let err = inspect(&exe).unwrap_err().to_string();
+        assert!(err.contains("ships DLSS"), "{err}");
+
+        // A plain folder is untouched by this.
+        let t2 = tempfile::tempdir().unwrap();
+        let exe2 = testutil::make_pe(&t2.path().join("game.exe"), PE_X64);
+        std::env::set_var("DLSS5ONECLICK_SKIP_GPU_CHECK", "1");
+        assert!(inspect(&exe2).is_ok());
+    }
+
+    /// A folder of thousands of entries is skipped by every walk; the exe,
+    /// the DLLs and the anti-cheat markers beside it are still found.
+    #[test]
+    fn huge_folders_are_not_walked() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let dump = d.join("paz_decrypted");
+        fs::create_dir_all(dump.join("deep")).unwrap();
+        for i in 0..2100 {
+            fs::write(dump.join(format!("{i}.bin")), b"x").unwrap();
+        }
+        assert!(huge_dir(&dump));
+        assert!(!huge_dir(d));
+        // Markers hidden inside the dump are not seen; beside the exe they are.
+        fs::write(dump.join("deep").join(DLSS_DLL), b"x").unwrap();
+        assert!(!game_ships_dlss(d));
+        fs::write(d.join(DLSS_DLL), b"x").unwrap();
+        assert!(game_ships_dlss(d));
     }
 }

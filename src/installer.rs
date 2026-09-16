@@ -65,7 +65,7 @@ Adapters = all
 FullScreenOutput = default
 ScalingMode = unspecified
 [DirectX]
-VideoCard = internal3D
+VideoCard = geforce_9800_gt
 VRAM = 4096
 Filtering = appdriven
 Mipmapping = appdriven
@@ -282,7 +282,33 @@ pub enum Engine {
     /// Dagherbou's OptiScaler fork with the built-in Neural Rendering pass.
     /// Games with native DLSS only (the pass reads the inputs the game hands to DLSS).
     Opti,
+    /// ReShade + kibblerz's standalone AIO add-on: neural rendering, super
+    /// resolution and frame generation from one add-on, in games with no DLSS
+    /// of their own. 64-bit games only here.
+    Aio,
 }
+
+const STEP_AIO: Step = Step {
+    name: "DLSS5 ReShade AIO (standalone add-on)",
+    name_zh: "DLSS5 ReShade AIO（独立附加组件）",
+    run: step_aio,
+};
+const STEP_AIO_RUNTIME: Step = Step {
+    name: "NVIDIA DLSS + frame-generation runtimes",
+    name_zh: "NVIDIA DLSS + 帧生成运行时",
+    run: step_aio_runtime,
+};
+const STEP_AIO_CONFIG: Step = Step {
+    name: "ReShade config",
+    name_zh: "ReShade 配置",
+    run: step_aio_config,
+};
+const STEP_AIO_CLEANUP: Step = Step {
+    name: "Remove the standalone AIO add-on (another consumer replaces it)",
+    name_zh: "移除独立 AIO 附加组件（已由其它消费者取代）",
+    run: step_aio_cleanup,
+};
+pub const AIO_REPO: &str = "kibblerz/DLSS5-Reshade-AIO";
 
 const STEP_OPTI: Step = Step {
     name: "OptiScaler + DLSS Neural Rendering",
@@ -302,8 +328,12 @@ pub struct Latest {
     pub reshade: Option<String>,
     pub feeder: Option<String>,
     pub opti: Option<String>,
+    /// wilsjo2's pre-SR fork numbers its releases on its own, so its newest tag
+    /// has to be carried separately from the stable build's.
+    pub opti_presr: Option<String>,
     pub dlss: Option<String>,
     pub dlssnr: Option<String>,
+    pub aio: Option<String>,
 }
 
 impl Latest {
@@ -312,8 +342,13 @@ impl Latest {
             reshade: resolve_reshade_setup(client).ok().map(|(v, _)| v),
             feeder: net::latest_tag(client, FEEDER_REPO).ok(),
             opti: net::latest_tag(client, OPTI_REPO).ok(),
-            dlss: rhi_latest(client, "dlss-").ok().map(|(t, _)| t),
+            opti_presr: net::latest_tag(client, OPTI_PRESR_REPO).ok(),
+            // Same source order as the install: NVIDIA's tag, else the mirror's.
+            dlss: nvidia_dll(client, game::DLSS_DLL)
+                .map(|(t, _)| t)
+                .or_else(|| rhi_latest(client, "dlss-").ok().map(|(t, _)| t)),
             dlssnr: rhi_latest(client, "dlssnr-").ok().map(|(t, _)| t),
+            aio: net::latest_tag(client, AIO_REPO).ok(),
         }
     }
 }
@@ -322,6 +357,18 @@ impl Latest {
 /// Used so the UI never says "Everything is in place" on a partial copy.
 pub fn missing_install_files(st: &GameStatus) -> Vec<String> {
     let mut missing = Vec::new();
+    if st.aio && !st.opti {
+        if !st.reshade {
+            missing.push(format!("{} (ReShade)", game::RESHADE_PROXY));
+        }
+        if !st.dlssnr {
+            missing.push(game::DLSSNR_DLL.into());
+        }
+        if !st.dlss {
+            missing.push(game::DLSS_DLL.into());
+        }
+        return missing;
+    }
     match st.mode {
         game::Mode::Feeder => {
             if !st.reshade {
@@ -404,8 +451,22 @@ pub fn stale_components(dir: &Path, latest: &Latest) -> Vec<String> {
         mine(game::DLSSNR_MARKER),
         &latest.dlssnr,
     );
+    if let Ok(m) = fs::read_to_string(dir.join(game::AIO_MANIFEST)) {
+        check("DLSS5 ReShade AIO", manifest_tag(&m), &latest.aio);
+    }
     if let Ok(m) = fs::read_to_string(dir.join(game::OPTI_MANIFEST)) {
-        match (manifest_tag(&m), &latest.opti) {
+        // Compare against the repo this install came from. Comparing a pre-SR
+        // tag (v0.7.7) with the stable build's (v0.2.0-dlssnr) reported an
+        // update on every run, and Install wrote the same tag back, so the
+        // notice never cleared (#88). Older manifests carry no repo line; the
+        // stable build's tags all end in "-dlssnr", which tells them apart.
+        let want = match manifest_repo(&m) {
+            Some(r) if r == OPTI_PRESR_REPO => &latest.opti_presr,
+            Some(_) => &latest.opti,
+            None if manifest_tag(&m).is_some_and(|t| !t.ends_with("-dlssnr")) => &latest.opti_presr,
+            None => &latest.opti,
+        };
+        match (manifest_tag(&m), want) {
             (Some(have), Some(want)) if have.trim() != want.trim() => {
                 out.push(format!("OptiScaler {} → {want}", have.trim()))
             }
@@ -425,20 +486,49 @@ fn manifest_tag(manifest: &str) -> Option<String> {
         .map(|t| t.trim().to_owned())
 }
 
+/// The repo an OptiScaler manifest was installed from, from its `# repo …`
+/// header. Absent in manifests written before 0.13.15.
+fn manifest_repo(manifest: &str) -> Option<String> {
+    manifest
+        .lines()
+        .find_map(|l| l.strip_prefix("# repo "))
+        .map(|t| t.trim().to_owned())
+}
+
 /// The first stable release carrying a `.zip`. Both forks also publish rolling
 /// "nightly" releases whose assets are `.7z`, and taking a release's first
 /// asset blindly picked a checksum text file or an archive the installer
 /// cannot open.
-fn pick_opti_zip(releases: &[Value]) -> Option<String> {
+///
+/// From v0.8.3 the pre-SR fork ships two zips per release — the standard build
+/// and an `-rtx40-mfg` variant — and lists the MFG one first. Taking the first
+/// zip would have handed the unlock build to everyone, against the author's
+/// own "choose the standard ZIP unless you need the optional RTX 40 MFG
+/// unlock". The variant is chosen by the MFG tick; a release with only one zip
+/// still gets that one.
+fn pick_opti_zip(releases: &[Value], want_mfg: bool) -> Option<String> {
     releases
         .iter()
         .filter(|r| r["prerelease"] != Value::Bool(true))
         .find_map(|r| {
-            r.get("assets")?.as_array()?.iter().find_map(|a| {
-                let url = a.get("browser_download_url")?.as_str()?;
-                let name = a.get("name")?.as_str()?.to_ascii_lowercase();
-                (name.ends_with(".zip") && !name.contains("sha256")).then(|| url.to_owned())
-            })
+            let zips: Vec<(String, String)> = r
+                .get("assets")?
+                .as_array()?
+                .iter()
+                .filter_map(|a| {
+                    let url = a.get("browser_download_url")?.as_str()?;
+                    let name = a.get("name")?.as_str()?.to_ascii_lowercase();
+                    (name.ends_with(".zip") && !name.contains("sha256"))
+                        .then(|| (name, url.to_owned()))
+                })
+                .collect();
+            if zips.is_empty() {
+                return None;
+            }
+            zips.iter()
+                .find(|(n, _)| n.contains("-mfg") == want_mfg)
+                .or_else(|| zips.first())
+                .map(|(_, u)| u.clone())
         })
 }
 
@@ -472,12 +562,16 @@ fn step_opti(
         };
         match (manifest_tag(&manifest), &latest) {
             (Some(a), Some(b)) if &a == b => {
-                return Ok(vec![crate::trfmt!("OptiScaler already current ({a})", "OptiScaler 已是最新（{a}）")]);
+                // Current, but the ticks may have changed since — apply them.
+                patch_opti_ini(st, d)?;
+                return Ok(vec![crate::trfmt!("OptiScaler already current ({a}), settings applied", "OptiScaler 已是最新（{a}），设置已应用")]);
             }
             (Some(a), Some(b)) => progress(0, &crate::trfmt!("OptiScaler {a} is out, {b} available", "OptiScaler {a} 已过时，{b} 可用")),
             (Some(_), None) => {
+                patch_opti_ini(st, d)?;
                 return Ok(vec![
-                    lang::tr("OptiScaler present (could not check for a newer one)", "已存在 OptiScaler（无法检查新版本）").to_owned()
+                    lang::tr("OptiScaler present (could not check for a newer one), settings applied", "已存在 OptiScaler（无法检查新版本），设置已应用")
+                        .to_owned(),
                 ]);
             }
             (None, _) => progress(0, lang::tr("OptiScaler version not recorded, refreshing", "未记录 OptiScaler 版本，正在刷新")),
@@ -485,19 +579,32 @@ fn step_opti(
     }
     // Stable release only (releases/latest skips pre-releases); the API list
     // and the releases page both put betas first.
+    // Two zips per release since the pre-SR fork's v0.8.3: the standard build
+    // ends in its version digit, the RTX 40 MFG variant in "-mfg". The tick
+    // decides; a release with a single zip matches the fallback either way.
+    let want_mfg = ada_mfg() == "true";
+    let by_name = |tag: &str| -> Result<String> {
+        let specific = if want_mfg {
+            r#"[^"]+-mfg\.zip"#
+        } else {
+            r#"[^"]+\d\.zip"#
+        };
+        net::github_asset_url_html(client, repo, tag, specific)
+            .or_else(|_| net::github_asset_url_html(client, repo, tag, r#"[^"]+\.zip"#))
+    };
     let asset: String = match latest.clone() {
-        Some(tag) => net::github_asset_url_html(client, repo, &tag, r#"[^"]+\.zip"#)?,
+        Some(tag) => by_name(&tag)?,
         None => match net::get_json_github(client, &opti_releases_url()) {
             Ok(releases) => releases
                 .as_array()
-                .and_then(|a| pick_opti_zip(a))
+                .and_then(|a| pick_opti_zip(a, want_mfg))
                 .ok_or_else(|| anyhow!("{}", crate::trfmt!("{repo} has no release asset", "{repo} 没有发布资源")))?,
             Err(_) => {
                 let tags = net::github_release_tags_html(client, repo, "v", 2)?;
                 let tag = tags
                     .first()
                     .ok_or_else(|| anyhow!("{}", crate::trfmt!("no {repo} release found", "未找到 {repo} 版本")))?;
-                net::github_asset_url_html(client, repo, tag, r#"[^"]+\.zip"#)?
+                by_name(tag)?
             }
         },
     };
@@ -554,6 +661,29 @@ fn step_opti(
     // OptiScaler ships DLSS Neural Rendering off, and its overlay toggle lives
     // only in memory unless the user finds the Save button -- so the whole
     // point of this install had to be switched back on at every launch.
+    patch_opti_ini(st, d)?;
+    // The repo goes in beside the tag: the two builds number their releases
+    // independently, so a tag alone cannot say whether v0.7.7 is current (#88).
+    let header = latest
+        .as_deref()
+        .map(|t| format!("# tag {t}\n# repo {}\n", opti_repo()))
+        .unwrap_or_default();
+    fs::write(
+        d.join(game::OPTI_MANIFEST),
+        format!("{header}{}", installed.join("\n")),
+    )?;
+    installed.push(game::OPTI_MANIFEST.into());
+    Ok(installed)
+}
+
+/// Apply this install's choices to `OptiScaler.ini`: neural rendering on, the
+/// model resolution, and the optional frame-generation switches.
+///
+/// Called on a fresh install and again when the package is already current —
+/// the ticks are the user's, and until this ran on the "already current"
+/// path too, changing Model Resolution or ticking frame generation on an
+/// up-to-date install wrote nothing at all.
+fn patch_opti_ini(st: &GameStatus, d: &Path) -> Result<()> {
     let ini = d.join(OPTI_INI);
     if let Ok(text) = fs::read_to_string(&ini) {
         let mut cur = text;
@@ -565,6 +695,40 @@ fn step_opti(
         // biggest performance lever on this route.
         if let Some(patched) = set_ini_key(&cur, "DlssNr", "WorkingScale", &working_scale()) {
             cur = patched;
+        }
+        // RTX 40 multi-frame generation. This one is built into the fork and
+        // memory-only — no file to fetch, nothing to sideload — so it is a
+        // setting we can honestly turn on for someone. The Ampere/Turing
+        // equivalent in the same ini sideloads a DLL that has no published
+        // release, so it is deliberately not offered (#83).
+        //
+        // The key lives under [DLSSG], not [FrameGen] — v0.13.12 through
+        // v0.13.14 wrote it into the wrong section, where OptiScaler never
+        // read it. From the fork's v0.8.3 the key exists only in the
+        // -rtx40-mfg package, which the tick now selects; on the standard
+        // package this line appends a key nothing reads, which is harmless.
+        if let Some(patched) = set_ini_key(&cur, "DLSSG", "AdaMfgUnlock", ada_mfg()) {
+            cur = patched;
+        }
+        // OptiScaler's own frame generation: FSR 3.1 interpolation over the
+        // upscaler it already runs, 2X, on any RTX card. Every library it
+        // needs ships in the package, so it is four keys. D3D12 only — every
+        // FG output in that ini is a D3D12 component. HUDFix is what the ini
+        // itself asks for with the upscaler as input ("To prevent UI
+        // glitching, Hudfix is required"). Off means untouched: the ini
+        // carries the user's own frame-generation choice from the overlay,
+        // and a refresh must not undo it.
+        if opti_fg() && matches!(st.api, game::Api::Dx12 | game::Api::Unknown) {
+            for (section, key, value) in [
+                ("FrameGen", "Enabled", "true"),
+                ("FrameGen", "FGInput", "upscaler"),
+                ("FrameGen", "FGOutput", "fsrfg"),
+                ("OptiFG", "HUDFix", "true"),
+            ] {
+                if let Some(patched) = set_ini_key(&cur, section, key, value) {
+                    cur = patched;
+                }
+            }
         }
         // RE Engine trips its own scheduler assertion unless the compute root
         // signature is put back, and fights REFramework over WndProc unless
@@ -586,21 +750,28 @@ fn step_opti(
         }
         fs::write(&ini, cur)?;
     }
-    let header = latest
-        .as_deref()
-        .map(|t| format!("# tag {t}\n"))
-        .unwrap_or_default();
-    fs::write(
-        d.join(game::OPTI_MANIFEST),
-        format!("{header}{}", installed.join("\n")),
-    )?;
-    installed.push(game::OPTI_MANIFEST.into());
-    Ok(installed)
+    Ok(())
 }
 
 /// Remove an OptiScaler install recorded in the manifest.
 fn uninstall_opti(d: &Path, removed: &mut Vec<String>) -> Result<()> {
-    let manifest = d.join(game::OPTI_MANIFEST);
+    uninstall_manifest(
+        d,
+        game::OPTI_MANIFEST,
+        &["OptiScaler/D3D12_OptiScaler", "OptiScaler", "Licenses"],
+        removed,
+    )
+}
+
+/// Remove every file listed in `manifest_name`, then the manifest itself and
+/// any of `empty_dirs` the archive created that are now empty.
+fn uninstall_manifest(
+    d: &Path,
+    manifest_name: &str,
+    empty_dirs: &[&str],
+    removed: &mut Vec<String>,
+) -> Result<()> {
+    let manifest = d.join(manifest_name);
     let Ok(list) = fs::read_to_string(&manifest) else {
         return Ok(());
     };
@@ -621,15 +792,19 @@ fn uninstall_opti(d: &Path, removed: &mut Vec<String>) -> Result<()> {
         }
     }
     // Clean now-empty folders the archive created.
-    for sub in ["OptiScaler/D3D12_OptiScaler", "OptiScaler", "Licenses"] {
+    for sub in empty_dirs {
         let p = d.join(sub.replace('/', std::path::MAIN_SEPARATOR_STR));
         if p.is_dir() && fs::read_dir(&p)?.next().is_none() {
             fs::remove_dir(&p)?;
         }
     }
     fs::remove_file(&manifest)?;
-    removed.push(game::OPTI_MANIFEST.into());
+    removed.push(manifest_name.into());
     Ok(())
+}
+
+fn uninstall_aio(d: &Path, removed: &mut Vec<String>) -> Result<()> {
+    uninstall_manifest(d, game::AIO_MANIFEST, &["licenses"], removed)
 }
 
 pub const BRIDGE_DOWNLOAD: &str =
@@ -639,6 +814,10 @@ pub const BRIDGE_DOWNLOAD: &str =
 /// RenoDX DLSS 5 add-on rather than joining it.
 const UPSTREAM_DOWNLOAD: &str =
     "https://github.com/matiasLombo/neural-upstream/releases/latest/download/nvngx.dll.addon64";
+/// mavismmg/MFGAdaUnlock-RenoDx: RTX 40 multi-frame generation as a ReShade
+/// add-on. DangerousBerries reached 6X with this where OptiScaler's own
+/// built-in unlock reported "DLSSG not patched: capability not matched" (#83).
+const MFG_DOWNLOAD: &str = "https://github.com/mavismmg/MFGAdaUnlock-RenoDx/releases/latest/download/renodx-mfgunlock.addon64";
 pub const RHI_RELEASES: &str =
     "https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100";
 pub const RHI_REPO: &str = "RankFTW/rhi-repo";
@@ -715,6 +894,11 @@ const STEP_BRIDGE: Step = Step {
     name_zh: "DLSS 5 DX11 桥接",
     run: step_bridge,
 };
+const STEP_MFG: Step = Step {
+    name: "RTX 40 multi-frame generation add-on",
+    name_zh: "RTX 40 多帧生成附加组件",
+    run: step_mfg,
+};
 const STEP_UPSTREAM: Step = Step {
     name: "Neural Upstream add-on (experimental)",
     name_zh: "神经上游附加组件（实验性）",
@@ -729,6 +913,11 @@ const STEP_FEEDER_CLEANUP: Step = Step {
     name: "Remove DLSS5-Feeder (game has native DLSS)",
     name_zh: "移除 DLSS5-Feeder（游戏自带原生 DLSS）",
     run: step_feeder_cleanup,
+};
+const STEP_DLSS5_CLEANUP: Step = Step {
+    name: "Remove the RenoDX DLSS 5 add-on (Neural Upstream replaces it)",
+    name_zh: "移除 RenoDX DLSS 5 附加组件（由神经上游取代）",
+    run: step_dlss5_cleanup,
 };
 const STEP_REFRAMEWORK: Step = Step {
     name: "REFramework (RE Engine needs it before ReShade)",
@@ -967,7 +1156,16 @@ fn step_renodx(
 /// the OptiScaler engine that needs ReShade too, loaded by OptiScaler as
 /// `ReShade64.dll`. RE Engine games get REFramework first on either engine.
 pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool, upstream: bool) -> Vec<Step> {
-    let mut v = if engine == Engine::Opti {
+    let mut v = if engine == Engine::Aio {
+        // The AIO is the whole consumer: ReShade to load it, the model and
+        // NVIDIA's runtimes beside it. No Feeder, no RenoDX add-on.
+        let mut v = vec![STEP_RESHADE, STEP_AIO, STEP_DLSSNR_ONLY, STEP_AIO_RUNTIME];
+        if with_renodx {
+            v.push(STEP_RENODX);
+        }
+        v.push(STEP_AIO_CONFIG);
+        v
+    } else if engine == Engine::Opti {
         // Only games with native DLSS: the NR pass reads the inputs the game
         // hands to DLSS. Callers gate on mode; return the plan regardless so
         // --check can show it.
@@ -985,6 +1183,14 @@ pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool, upstream: b
         }
         v
     };
+    // RTX 40 multi-frame generation. On the OptiScaler route the fork writes
+    // its own ini key; on the ReShade route it is this separate add-on, which
+    // is what actually reached 6X for the reporter in #83. It is an .addon64,
+    // so a 32-bit game's ReShade could not load it.
+    if engine == Engine::ReShade && ada_mfg() == "true" && !st.is32() {
+        let at = v.len().saturating_sub(1); // before ReShade config
+        v.insert(at, STEP_MFG);
+    }
     if st.re_engine {
         v.insert(0, STEP_REFRAMEWORK);
     }
@@ -1000,6 +1206,16 @@ pub fn plan_with(st: &GameStatus, engine: Engine, with_renodx: bool, upstream: b
 }
 
 fn plan_reshade(st: &GameStatus, upstream: bool) -> Vec<Step> {
+    let mut v = plan_reshade_consumer(st, upstream);
+    // Two neural consumers in one ReShade would both create NGX features on
+    // the same frame; the AIO goes when this route takes over.
+    if st.aio {
+        v.insert(1, STEP_AIO_CLEANUP);
+    }
+    v
+}
+
+fn plan_reshade_consumer(st: &GameStatus, upstream: bool) -> Vec<Step> {
     match st.mode {
         game::Mode::Feeder => {
             let mut v = vec![STEP_RESHADE];
@@ -1024,6 +1240,7 @@ fn plan_reshade(st: &GameStatus, upstream: bool) -> Vec<Step> {
             // DLSSNR feature and needs only the model beside it, so it takes
             // the RenoDX add-on's place rather than sitting next to it.
             if upstream {
+                v.push(STEP_DLSS5_CLEANUP);
                 v.push(STEP_UPSTREAM);
                 v.push(STEP_DLSSNR_ONLY);
             } else {
@@ -1089,8 +1306,30 @@ fn best_tag(mut cands: Vec<(Vec<u64>, String, String)>) -> (String, String) {
 
 /// rhi-repo lookup that never needs the API: HTML releases pages for the tag,
 /// the expanded-assets fragment for the file.
-/// Tag of the DLSS 5 add-on build to install; unset means the newest one.
+/// Tag of the DLSS 5 add-on build to install. Unset means the default build;
+/// `latest` means whatever rhi-repo lists newest; anything else is a tag.
 pub const RENODX_TAG_ENV: &str = "DLSS5ONECLICK_RENODX_TAG";
+
+/// The build installed when nothing else is asked for. 5.2.1 went live on
+/// rhi-repo on September 11 and within three days four games came back
+/// broken on it — Dragon's Dogma 2 crashing at the first evaluate (4.55 ran,
+/// an A/B on the same folder, #96), RDR2 with blown-out colour (#86), Elden
+/// Ring under Proton white (#76), Lunar Eclipse flashing (#100) — where the
+/// build before it, 4.70, was the one every reporter had working. So 4.70 is
+/// the default and the newest build is the opt-in.
+pub const RENODX_DEFAULT_TAG: &str = "renodx-dlss5-4.70";
+/// The env value that asks for the newest build instead of the default.
+pub const RENODX_LATEST: &str = "latest";
+
+/// What `DLSS5ONECLICK_RENODX_TAG` resolves to: `Some(tag)` to pin, `None`
+/// for the newest build.
+pub fn renodx_tag_choice(env: Option<&str>) -> Option<String> {
+    match env.map(str::trim) {
+        None | Some("") => Some(RENODX_DEFAULT_TAG.to_owned()),
+        Some(v) if v.eq_ignore_ascii_case(RENODX_LATEST) => None,
+        Some(v) => Some(v.to_owned()),
+    }
+}
 
 /// The classic-engine add-on. The Feeder's own host measured v4.7 to fault
 /// inside the driver's NGX runtime on NVIDIA 616.64 — an access violation in
@@ -1103,10 +1342,7 @@ fn rhi_pinned(client: &Client, prefix: &str) -> Option<Result<(String, String)>>
     if prefix != "renodx-dlss5-" {
         return None;
     }
-    let tag = std::env::var(RENODX_TAG_ENV).ok()?;
-    if tag.is_empty() {
-        return None;
-    }
+    let tag = renodx_tag_choice(std::env::var(RENODX_TAG_ENV).ok().as_deref())?;
     Some(
         net::github_asset_url_html(client, RHI_REPO, &tag, r#"[^"]+\.zip"#)
             .map(|url| (tag.clone(), url))
@@ -1142,6 +1378,22 @@ pub fn rhi_latest(client: &Client, prefix: &str) -> Result<(String, String)> {
     let (tag, _) = best_tag(cands);
     let url = net::github_asset_url_html(client, RHI_REPO, &tag, r#"[^"]+\.zip"#)?;
     Ok((tag, url))
+}
+
+/// NVIDIA's own DLSS repository: `nvngx_dlss.dll` and `nvngx_dlssg.dll` sit
+/// in it at every release tag, byte-identical to the copies rhi-repo mirrors
+/// (checked at v310.9.1: same size, same SHA-256 for both). Fetching from the
+/// publisher answers the provenance question the mirror could not.
+pub const NVIDIA_DLSS_REPO: &str = "NVIDIA/DLSS";
+
+/// The newest NVIDIA/DLSS release tag and the raw URL of `name` under it —
+/// `(tag, url)`. `None` when the lookup fails; callers fall back to the mirror.
+pub fn nvidia_dll(client: &Client, name: &str) -> Option<(String, String)> {
+    let tag = net::latest_tag(client, NVIDIA_DLSS_REPO).ok()?;
+    let url = format!(
+        "https://raw.githubusercontent.com/{NVIDIA_DLSS_REPO}/{tag}/lib/Windows_x86_64/rel/{name}"
+    );
+    Some((tag, url))
 }
 
 // ── step 1: ReShade ────────────────────────────────────────────────
@@ -1275,7 +1527,7 @@ fn merge_dgvoodoo_conf(existing: &str) -> String {
 
     if !saw_directx {
         out.push_str("\n[DirectX]\n");
-        out.push_str("VideoCard = internal3D\n");
+        out.push_str("VideoCard = geforce_9800_gt\n");
         out.push_str(&format!("VRAM = {DGVOODOO_VRAM_FLOOR}\n"));
         out.push_str("dgVoodooWatermark = false\n");
         out.push_str("Antialiasing = appdriven\n");
@@ -1383,11 +1635,18 @@ pub fn install_dgvoodoo_from_zip(
             "a d3d9.dll that is not dgVoodoo is already present; remove or replace it, then Install again"
         );
     }
+    let had_conf = game_dir.join(game::DGVOODOO_CONF).is_file();
     net::extract_member(&mut zip, &member, &dest)?;
     write_dgvoodoo_conf(game_dir)?;
     if !game::is_dgvoodoo(game_dir) {
         bail!("wrote d3d9.dll + dgVoodoo.conf but dgVoodoo was not detected afterward");
     }
+    // Record what this tool put there so Remove can take it away again (#91).
+    let mut marker = format!("{DGVOODOO_TAG}\n");
+    if !had_conf {
+        marker.push_str("conf-ours\n");
+    }
+    fs::write(game_dir.join(game::DGVOODOO_MARKER), marker)?;
     Ok(vec!["d3d9.dll".into(), "dgVoodoo.conf".into()])
 }
 
@@ -1438,9 +1697,13 @@ fn step_reshade(
             game::RESHADE_PROXY
         ));
     }
+    // A proxy of the wrong bitness is invisible from inside the game: the
+    // loader simply does not load it, ReShade writes no log, and the Home key
+    // does nothing. Whatever the marker says, that one gets replaced (#69).
+    let wrong_bitness = st.reshade && game::exe_bitness(&proxy).is_ok_and(|b| b != st.bitness);
     progress(0, lang::tr("Looking up latest ReShade", "正在查找最新 ReShade"));
     let (ver, url) = resolve_reshade_setup(client)?;
-    if st.reshade {
+    if st.reshade && !wrong_bitness {
         // Only a copy this tool placed is refreshed; a user's own ReShade stays.
         match fs::read_to_string(d.join(game::RESHADE_MARKER)) {
             Ok(mine) if mine.trim() == ver => {
@@ -1456,8 +1719,26 @@ fn step_reshade(
     }
     let setup = work.join(format!("ReShade_Setup_{ver}_Addon.exe"));
     net::download(client, &url, &setup, "ReShade", progress)?;
-    let out = install_reshade_from_setup(&setup, d, st.bitness, game::RESHADE_PROXY)?;
+    let mut out = install_reshade_from_setup(&setup, d, st.bitness, game::RESHADE_PROXY)?;
     fs::write(d.join(game::RESHADE_MARKER), ver.as_bytes())?;
+    if wrong_bitness {
+        out.push(format!(
+            "{} was {}-bit in a {}-bit game and has been replaced",
+            game::RESHADE_PROXY,
+            if st.bitness == 32 { 64 } else { 32 },
+            st.bitness
+        ));
+        // The 64-bit add-on cannot belong to a 32-bit game either; it came from
+        // the same mistaken install and ReShade would keep trying to load it.
+        let stray = d.join(game::FEEDER_ADDON);
+        if st.is32() && stray.is_file() {
+            fs::remove_file(&stray)?;
+            out.push(format!(
+                "{} removed (64-bit add-on in a 32-bit game)",
+                game::FEEDER_ADDON
+            ));
+        }
+    }
     Ok(out)
 }
 
@@ -1561,11 +1842,25 @@ fn step_feeder(
     if st.is32() && host_member.is_none() {
         bail!("{}", crate::trfmt!("DLSS5-Feeder {tag} has no {}", "DLSS5-Feeder {tag} 中没有 {}", game::HOST_EXE));
     }
+    // The 32-bit halves talk a versioned IPC protocol to each other, and a
+    // mismatch is fatal at runtime: "the game add-on speaks protocol v8, this
+    // host v9 -- the two halves are from different releases" and the host exits
+    // (#69). Sizes cannot see that, so the tag each half was taken from is
+    // recorded and both are replaced unless both markers name this release.
+    let marker_says = |dir: &Path| -> bool {
+        fs::read_to_string(dir.join(game::FEEDER_MARKER)).is_ok_and(|m| m.trim() == tag.as_str())
+    };
+    let halves_agree = !st.is32() || marker_says(&st.consumer_dir());
     let host_current = match &host_member {
         Some(m) => same_size(&mut zip, m, &st.consumer_dir().join(game::HOST_EXE)),
         None => true,
     };
-    if st.feeder && host_current && same_size(&mut zip, &addon, &d.join(addon_name)) {
+    if st.feeder
+        && halves_agree
+        && marker_says(d)
+        && host_current
+        && same_size(&mut zip, &addon, &d.join(addon_name))
+    {
         return Ok(vec![crate::trfmt!("DLSS5-Feeder already current ({tag}{note})", "DLSS5-Feeder 已是最新（{tag}{note}）")]);
     }
     net::extract_member(&mut zip, &addon, &d.join(addon_name))?;
@@ -1575,6 +1870,9 @@ fn step_feeder(
         let host = st.consumer_dir();
         fs::create_dir_all(&host)?;
         net::extract_member(&mut zip, m, &host.join(game::HOST_EXE))?;
+        // Both halves now carry the tag they came from, so a later install can
+        // tell "same release" from "same size".
+        fs::write(host.join(game::FEEDER_MARKER), tag.as_bytes())?;
         out.push(format!(
             "{}/{} ({tag}{note})",
             game::HOST_DIR,
@@ -1693,7 +1991,12 @@ fn step_dlss5(
     // two NVIDIA DLLs by the release tag recorded when this tool placed them.
     // A DLL without a marker is the game's or the user's and is left alone.
     let plan = [
-        ("renodx-dlss5-", game::DLSS5_ADDON, false, None),
+        (
+            "renodx-dlss5-",
+            game::DLSS5_ADDON,
+            false,
+            Some(game::DLSS5_ADDON_MARKER),
+        ),
         (
             "dlssnr-",
             game::DLSSNR_DLL,
@@ -1710,9 +2013,27 @@ fn step_dlss5(
     progress(0, lang::tr("Looking up DLSS 5 add-on releases", "正在查找 DLSS 5 附加组件版本"));
     let cdir = st.consumer_dir();
     fs::create_dir_all(&cdir)?;
+    // This machine has already been told, by the Feeder's own host, that the
+    // current add-on build faults in its driver. Fetching that build again just
+    // reproduces it, so take the one the host names as passing — unless the
+    // user pinned a build themselves, in which case that wins (#69).
+    // A 32-bit game was excluded here for no reason I can defend: its add-on
+    // lives in host64\ and is fetched by this same loop, and its host is the
+    // very thing that prints the verdict. sempie27's GTA IV kept getting v4.7
+    // back while its own log said v4.7 faults on this driver (#69).
+    let auto_classic = std::env::var_os(RENODX_TAG_ENV).is_none() && addon_faulted_in_driver(&cdir);
+    if auto_classic {
+        std::env::set_var(RENODX_TAG_ENV, RENODX_CLASSIC_TAG);
+    }
     let mut installed = Vec::new();
     for (prefix, fname, present, marker) in plan {
-        let (tag, url) = rhi_latest(client, prefix)?;
+        // NVIDIA's own DLL comes from NVIDIA's own repository when it can be
+        // reached; the mirror is the fallback, not the source.
+        let direct = fname == game::DLSS_DLL;
+        let (tag, url) = match (direct, nvidia_dll(client, fname)) {
+            (true, Some(t)) => t,
+            _ => rhi_latest(client, prefix)?,
+        };
         if present {
             match marker.map(|m| fs::read_to_string(cdir.join(m))) {
                 Some(Ok(mine)) if mine.trim() == tag => {
@@ -1726,9 +2047,23 @@ fn step_dlss5(
                 }
             }
         }
+        let dest = cdir.join(fname);
+        // A raw DLL from NVIDIA's repository is the file itself, not a zip.
+        if url.ends_with(".dll") {
+            let tmp = work.join(fname);
+            net::download(client, &url, &tmp, fname, progress)?;
+            if game::exe_bitness(&tmp).ok() != Some(64) {
+                bail!("{fname} from {NVIDIA_DLSS_REPO} {tag} is not a 64-bit Windows DLL");
+            }
+            fs::copy(&tmp, &dest)?;
+            if let Some(m) = marker {
+                fs::write(cdir.join(m), tag.as_bytes())?;
+            }
+            installed.push(format!("{fname} ({NVIDIA_DLSS_REPO} {tag})"));
+            continue;
+        }
         let z = work.join(format!("{tag}.zip"));
         net::download(client, &url, &z, fname, progress)?;
-        let dest = cdir.join(fname);
         if fname == game::DLSS5_ADDON && st.dlss5_addon {
             let f = fs::File::open(&z)?;
             let mut zip =
@@ -1738,6 +2073,12 @@ fn step_dlss5(
                 .find(|n| net::file_name(n).eq_ignore_ascii_case(fname))
                 .map(str::to_owned);
             if hit.is_some_and(|h| same_size(&mut zip, &h, &dest)) {
+                // Record the tag even when nothing is copied: every build of
+                // this add-on carries the same FileVersion, so the tag on disk
+                // is the only way anything afterwards can name the build.
+                if let Some(m) = marker {
+                    let _ = fs::write(cdir.join(m), tag.as_bytes());
+                }
                 installed.push(crate::trfmt!("{fname} already current ({tag})", "{fname} 已是最新（{tag}）"));
                 continue;
             }
@@ -1793,6 +2134,161 @@ fn step_dlssnr_only(
     Ok(vec![format!("{} ({tag})", game::DLSSNR_DLL)])
 }
 
+// ── aio engine: kibblerz's standalone add-on, whole zip beside the exe ──
+
+/// Extract the 64-bit AIO release into the game folder and record every path
+/// in a manifest, tag in the header, for refresh and Remove. Any other neural
+/// consumer this tool placed goes first: two of them in one ReShade would each
+/// create NGX features on the same frame.
+fn step_aio(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let d = st.game_dir();
+    progress(0, "Looking up DLSS5 ReShade AIO releases");
+    let tag = net::latest_tag(client, AIO_REPO)?;
+    let mut installed = Vec::new();
+    for (name, marker) in [
+        (game::FEEDER_ADDON, Some(game::FEEDER_MARKER)),
+        (game::DLSS5_ADDON, Some(game::DLSS5_ADDON_MARKER)),
+        (game::UPSTREAM_ADDON, None),
+        (game::BRIDGE_ADDON, None),
+        (game::MFG_ADDON, None),
+    ] {
+        for f in std::iter::once(name).chain(marker) {
+            let p = d.join(f);
+            if p.is_file() {
+                fs::remove_file(&p)?;
+                if f == name {
+                    installed.push(format!("removed {f} (the AIO replaces it)"));
+                }
+            }
+        }
+    }
+    if let Ok(m) = fs::read_to_string(d.join(game::AIO_MANIFEST)) {
+        if st.aio && manifest_tag(&m).as_deref() == Some(tag.as_str()) {
+            installed.push(format!("{} already current ({tag})", game::AIO_ADDON));
+            return Ok(installed);
+        }
+        progress(0, &format!("DLSS5 ReShade AIO: {tag} is out, refreshing"));
+    }
+    let url = net::github_asset_url_html(client, AIO_REPO, &tag, r#"[^"]+-64-bit\.zip"#)?;
+    let zip_path = work.join("dlss5-aio.zip");
+    net::download(client, &url, &zip_path, "DLSS5 ReShade AIO", progress)?;
+    let f = fs::File::open(&zip_path)?;
+    let mut zip = zip::ZipArchive::new(f).context("AIO download is not a valid zip")?;
+    let names: Vec<String> = zip.file_names().map(str::to_owned).collect();
+    let mut written: Vec<String> = Vec::new();
+    for member in names {
+        let rel = member.replace('\\', "/");
+        if rel.ends_with('/') {
+            continue;
+        }
+        let parts: Vec<&str> = rel
+            .split('/')
+            .filter(|p| !p.is_empty() && *p != "." && *p != "..")
+            .collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let out_rel = parts.join("/");
+        let dest = d.join(out_rel.replace('/', std::path::MAIN_SEPARATOR_STR));
+        net::extract_member(&mut zip, &member, &dest)?;
+        written.push(out_rel);
+    }
+    if !written.iter().any(|p| p == game::AIO_ADDON) {
+        bail!(
+            "the AIO release had no {} — layout changed upstream",
+            game::AIO_ADDON
+        );
+    }
+    fs::write(
+        d.join(game::AIO_MANIFEST),
+        format!("# tag {tag}\n# repo {AIO_REPO}\n{}", written.join("\n")),
+    )?;
+    installed.push(format!("{} ({tag})", game::AIO_ADDON));
+    installed.extend(written.into_iter().filter(|p| p != game::AIO_ADDON));
+    installed.push(game::AIO_MANIFEST.into());
+    Ok(installed)
+}
+
+/// `nvngx_dlss.dll` and `nvngx_dlssg.dll` beside the AIO: the add-on creates
+/// its own super-resolution and frame-generation features, so both must be in
+/// the folder even in a game that never shipped them. One the game did ship is
+/// left alone.
+fn step_aio_runtime(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let d = st.game_dir();
+    let mut out = Vec::new();
+    for (name, marker, prefix) in [
+        (game::DLSS_DLL, game::DLSS_MARKER, "dlss-"),
+        (game::DLSSG_DLL, game::DLSSG_MARKER, "dlssg-"),
+    ] {
+        let dest = d.join(name);
+        let marker = d.join(marker);
+        if dest.is_file() && !marker.is_file() {
+            out.push(format!("{name} present (not placed by this tool)"));
+            continue;
+        }
+        progress(0, &format!("Looking up {name} releases"));
+        let (tag, url) = match nvidia_dll(client, name) {
+            Some(t) => t,
+            None => rhi_latest(client, prefix)?,
+        };
+        if dest.is_file() && fs::read_to_string(&marker).is_ok_and(|t| t.trim() == tag) {
+            out.push(format!("{name} already current ({tag})"));
+            continue;
+        }
+        if url.ends_with(".dll") {
+            let tmp = work.join(name);
+            net::download(client, &url, &tmp, name, progress)?;
+            if game::exe_bitness(&tmp).ok() != Some(64) {
+                bail!("{name} from {NVIDIA_DLSS_REPO} {tag} is not a 64-bit Windows DLL");
+            }
+            fs::copy(&tmp, &dest)?;
+        } else {
+            let z = work.join(format!("{tag}.zip"));
+            net::download(client, &url, &z, name, progress)?;
+            install_single_from_zip(&z, name, &dest)?;
+        }
+        fs::write(&marker, tag.as_bytes())?;
+        out.push(format!("{name} ({tag})"));
+    }
+    Ok(out)
+}
+
+/// ReShade.ini for the AIO: the add-on carries its own settings, so only the
+/// ini itself and a cleared disabled-add-ons list.
+fn step_aio_config(
+    _c: &Client,
+    st: &GameStatus,
+    _w: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    reshade_ini::write_reshade_ini(st.game_dir())?;
+    reshade_ini::clear_disabled_addons(st.game_dir())?;
+    progress(100, "ReShade.ini written");
+    Ok(vec![game::RESHADE_INI.into()])
+}
+
+fn step_aio_cleanup(
+    _c: &Client,
+    st: &GameStatus,
+    _w: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    progress(0, "Removing the standalone AIO add-on");
+    let mut removed = Vec::new();
+    uninstall_aio(st.game_dir(), &mut removed)?;
+    Ok(removed)
+}
+
 // ── native mode: a Feeder left over from an earlier install must go ─
 
 fn step_feeder_cleanup(
@@ -1824,6 +2320,42 @@ fn step_feeder_cleanup(
         100,
         lang::tr("DLSS5-Feeder removed; the add-on hooks the game's own DLSS", "已移除 DLSS5-Feeder；附加组件将挂钩游戏自带的 DLSS"),
     );
+    Ok(removed)
+}
+
+/// ReShade loads every add-on it finds.
+///
+/// They are not additive. Both detour `NVSDK_NGX_D3D12_CreateFeature` and
+/// `EvaluateFeature`, and both create NGX feature 18 on the same device. The
+/// second create is refused, so the user gets no neural rendering at all rather
+/// than one of the two implementations.
+fn step_dlss5_cleanup(
+    _c: &Client,
+    st: &GameStatus,
+    _w: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let mut removed = Vec::new();
+    let f = st.consumer_dir().join(game::DLSS5_ADDON);
+    if f.is_file() {
+        fs::remove_file(&f)?;
+        removed.push(game::DLSS5_ADDON.to_owned());
+        progress(
+            100,
+            lang::tr(
+                "RenoDX DLSS 5 add-on removed; Neural Upstream replaces it",
+                "已移除 RenoDX DLSS 5 附加组件；由神经上游取代",
+            ),
+        );
+    } else {
+        progress(
+            100,
+            lang::tr(
+                "no RenoDX DLSS 5 add-on to remove",
+                "没有需要移除的 RenoDX DLSS 5 附加组件",
+            ),
+        );
+    }
     Ok(removed)
 }
 
@@ -1859,6 +2391,95 @@ fn step_bridge(
     }
     net::download(client, BRIDGE_DOWNLOAD, &dest, game::BRIDGE_ADDON, progress)?;
     Ok(vec![game::BRIDGE_ADDON.into()])
+}
+
+/// The RTX 40 MFG add-on, fetched only when the tick asked for it.
+///
+/// Like the bridge it carries no version in its file name, so an existing copy
+/// is refreshed whenever the published file differs in size.
+fn step_mfg(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let dest = st.game_dir().join(game::MFG_ADDON);
+    if st.mfg && dest.is_file() {
+        let local = fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        match net::remote_len(client, MFG_DOWNLOAD) {
+            Ok(Some(remote)) if remote != local => {
+                progress(0, "MFG unlock changed upstream, refreshing");
+            }
+            Ok(_) => {
+                return Ok(vec![format!("{} already current", game::MFG_ADDON)]);
+            }
+            Err(_) => {
+                return Ok(vec![format!(
+                    "{} present (could not check for a newer one)",
+                    game::MFG_ADDON
+                )]);
+            }
+        }
+    } else {
+        progress(0, "Fetching the RTX 40 MFG unlock");
+    }
+    net::download(client, MFG_DOWNLOAD, &dest, game::MFG_ADDON, progress)?;
+    let mut done = vec![game::MFG_ADDON.to_owned()];
+    done.extend(mfg_provider(client, st, work, progress)?);
+    Ok(done)
+}
+
+/// The frame-generation provider the MFG add-on will accept.
+///
+/// Version 0.9 validates the provider by build and refuses the rest: a reporter
+/// with an RTX 4060 got "Validated provider result: unsupported/unknown" and no
+/// effect at all, on a game whose own menu offered 2X-6X (#90). The add-on's
+/// README says to use the newest `nvngx_dlssg.dll`; rhi-repo publishes it, the
+/// same place this tool already takes `nvngx_dlss.dll` and the neural model
+/// from, so Install can place it without asking anyone to fetch a DLL.
+///
+/// A provider the game shipped is moved to `.original` rather than overwritten,
+/// and Remove puts it back.
+fn mfg_provider(
+    client: &Client,
+    st: &GameStatus,
+    work: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let d = st.game_dir();
+    let dest = d.join(game::DLSSG_DLL);
+    let marker = d.join(game::DLSSG_MARKER);
+    progress(0, "Looking up frame-generation runtime releases");
+    // NVIDIA's repository first (byte-identical to the mirror at v310.9.1),
+    // the mirror when it cannot be reached.
+    let (tag, url) = match nvidia_dll(client, game::DLSSG_DLL) {
+        Some(t) => t,
+        None => rhi_latest(client, "dlssg-")?,
+    };
+    if fs::read_to_string(&marker).is_ok_and(|t| t.trim() == tag) {
+        return Ok(vec![format!("{} already current ({tag})", game::DLSSG_DLL)]);
+    }
+    let backup = d.join(game::DLSSG_BACKUP);
+    if dest.is_file() && !marker.is_file() && !backup.is_file() {
+        fs::rename(&dest, &backup)?;
+    }
+    if url.ends_with(".dll") {
+        let tmp = work.join(game::DLSSG_DLL);
+        net::download(client, &url, &tmp, game::DLSSG_DLL, progress)?;
+        if game::exe_bitness(&tmp).ok() != Some(64) {
+            bail!(
+                "{} from {NVIDIA_DLSS_REPO} {tag} is not a 64-bit Windows DLL",
+                game::DLSSG_DLL
+            );
+        }
+        fs::copy(&tmp, &dest)?;
+    } else {
+        let z = work.join(format!("{tag}.zip"));
+        net::download(client, &url, &z, game::DLSSG_DLL, progress)?;
+        install_single_from_zip(&z, game::DLSSG_DLL, &dest)?;
+    }
+    fs::write(&marker, tag.as_bytes())?;
+    Ok(vec![format!("{} ({tag})", game::DLSSG_DLL)])
 }
 
 // ── step 5c: neural-upstream (experimental consumer, native DLSS only) ──
@@ -1913,6 +2534,33 @@ fn step_upstream(
     Ok(done)
 }
 
+/// RTX 40 multi-frame generation on the OptiScaler route; unset means off.
+pub const ADA_MFG_ENV: &str = "DLSS5ONECLICK_ADA_MFG";
+
+/// `"true"` when the RTX 40 MFG unlock was asked for, else `"false"`.
+///
+/// The fork's own note: "Optional built-in y4my4my4m RTX 40 MFG unlock.
+/// Memory-only, supported runtimes only." Memory-only is what makes it
+/// offerable here — there is no second download and nothing for the user to
+/// place by hand.
+fn ada_mfg() -> &'static str {
+    if std::env::var_os(ADA_MFG_ENV).is_some() {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+/// OptiScaler's own frame generation (AMD FSR 3.1, 2X) on the OptiScaler
+/// route; unset means off. The libraries it needs ship in every OptiScaler
+/// package this tool installs, so it is ini keys and nothing else — which is
+/// what makes it offerable on RTX 20 and 30 where NVIDIA's own is not.
+pub const OPTI_FG_ENV: &str = "DLSS5ONECLICK_OPTI_FG";
+
+fn opti_fg() -> bool {
+    std::env::var_os(OPTI_FG_ENV).is_some()
+}
+
 /// Which neural-upstream strength preset to seed; 0 leaves the overlay's own.
 pub const UPSTREAM_PRESET_ENV: &str = "DLSS5ONECLICK_UPSTREAM_PRESET";
 
@@ -1946,8 +2594,98 @@ fn install_quality() -> ResolvedQuality {
 /// The feed retries three times and stops, before any DLSS create, so the whole
 /// install goes quiet and nothing on screen says why (#74).
 pub fn work_resolution_refused(game_dir: &Path) -> bool {
-    fs::read_to_string(game_dir.join("dlss5-feed.log"))
-        .is_ok_and(|l| l.contains("work-resolution staging SRV failed"))
+    let Ok(log) = fs::read_to_string(game_dir.join("dlss5-feed.log")) else {
+        return false;
+    };
+    if !log.contains("work-resolution staging SRV failed") {
+        return false;
+    }
+    // Feeder 0.15.0 fixed the cause: the staging copy was created in the
+    // backbuffer's exact ..._UNORM_SRGB format and then viewed as ..._UNORM,
+    // which a D3D11 view may not do unless the resource is typeless, so every
+    // reduced work resolution failed on an sRGB swapchain (DLSS5-Feeder#85).
+    // A failure logged by an older build says nothing about the one this very
+    // install is about to put in the folder, so it must not hold the setting
+    // down forever.
+    feeder_log_version(&log).is_none_or(|v| v >= FEEDER_SRGB_FIX)
+}
+
+/// First Feeder release where a reduced work resolution works on an sRGB
+/// swapchain.
+const FEEDER_SRGB_FIX: [u64; 3] = [0, 15, 0];
+
+/// `"HH:MM:SS.mmm  dlss5-feed 0.15.0 (built ...) attached."` -> `[0, 15, 0]`.
+fn feeder_log_version(log: &str) -> Option<[u64; 3]> {
+    let mut it = log.lines().next()?.split_whitespace();
+    it.find(|t| t.starts_with("dlss5-feed"))?;
+    let raw = it.next()?;
+    let mut parts = raw.split(['.', '-']).map(|p| p.parse::<u64>().unwrap_or(0));
+    let v = [
+        parts.next()?,
+        parts.next().unwrap_or(0),
+        parts.next().unwrap_or(0),
+    ];
+    raw.chars().next()?.is_ascii_digit().then_some(v)
+}
+
+/// True when this game's own logs say the DLSS 5 add-on faulted inside the
+/// driver's NGX runtime.
+///
+/// The Feeder's host prints that verdict itself, having measured it: the neural
+/// evaluate takes an access violation in `D3D12Core.dll` reached through
+/// `nvngx_dlssnr.dll`, so DLSS 5 delivers nothing while everything else keeps
+/// working. It names the classic add-on build as one that passes there. Read
+/// the machine's own evidence rather than assuming it from a driver number —
+/// the measurement covers 616.64, and newer drivers are untested (#69).
+/// Where the driver verdict is remembered once a log has stated it. A game
+/// folder is the wrong place to keep it: Remove empties the folder, a fresh
+/// game has no log yet, and the fault belongs to the driver rather than to any
+/// one game.
+fn driver_fault_flag() -> PathBuf {
+    crate::settings::Settings::path().with_file_name("driver-fault.txt")
+}
+
+pub fn addon_faulted_in_driver(consumer_dir: &Path) -> bool {
+    faulted_in_driver_at(
+        consumer_dir,
+        &driver_fault_flag(),
+        crate::gpu::nvidia_driver(),
+    )
+}
+
+/// The decision itself, with its two pieces of state passed in so a test can
+/// exercise it without touching the machine's own file or its real driver.
+fn faulted_in_driver_at(consumer_dir: &Path, flag: &Path, driver: Option<String>) -> bool {
+    // On a 32-bit game the feed's log is beside the exe and the host's is in
+    // host64\; on a 64-bit one both are the same folder. Check the pair either
+    // way rather than assuming which layout this is.
+    let dirs = [consumer_dir.to_path_buf(), consumer_dir.join("..")];
+    let in_logs = dirs.iter().any(|d| {
+        ["dlss5-feed.log", "dlss5-feed-host.log"].iter().any(|n| {
+            fs::read_to_string(d.join(n))
+                .is_ok_and(|l| l.contains("is a combination measured to fail"))
+        })
+    });
+    let Some(drv) = driver else {
+        return in_logs;
+    };
+    if in_logs {
+        // Record it against the driver that produced it, so a driver update
+        // retires the verdict by itself.
+        if let Some(dir) = flag.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        let _ = fs::write(flag, drv.as_bytes());
+        return true;
+    }
+    match fs::read_to_string(flag) {
+        Ok(seen) if seen.trim() == drv => true,
+        Ok(_) => {
+            let _ = fs::remove_file(flag);
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 pub fn write_feeder_cfg(game_dir: &Path, r: &ResolvedQuality) -> Result<()> {
@@ -2078,10 +2816,15 @@ pub fn run_all_with(
     if !st.problems.is_empty() {
         bail!("{}", st.problems.join("\n"));
     }
-    if engine == Engine::ReShade {
+    if engine != Engine::Opti {
         if let Some(p) = st.reshade_engine_problem() {
             bail!("{p}");
         }
+    }
+    if engine == Engine::Aio && st.is32() {
+        bail!(
+            "The standalone AIO engine is 64-bit only here; a 32-bit game takes the Feeder path."
+        );
     }
     if upstream && (engine != Engine::ReShade || st.mode != game::Mode::Native) {
         bail!("{}", crate::trfmt!("Neural Upstream runs the network on the colour buffer the game hands its own DLSS, so it needs a game with DLSS of its own on the ReShade engine. This game has none - use the stable ReShade add-on.", "神经上游在网络运行于游戏交给自身 DLSS 的色彩缓冲上，因此需要游戏在 ReShade 引擎上自带 DLSS。此游戏没有 —— 请使用稳定版 ReShade 附加组件。"
@@ -2121,7 +2864,7 @@ pub fn run_all_with(
                 results.push((lang::tr(step.name, step.name_zh).to_owned(), files));
             }
             Err(e) => {
-                let msg = format!("{e:#}");
+                let msg = access_denied_hint(&format!("{e:#}"), st.game_dir());
                 step_cb(i, n, lang::tr(step.name, step.name_zh), StepState::Error, &msg);
                 if let Ok(mut slot) = INSTALL_QUALITY.lock() {
                     *slot = None;
@@ -2143,6 +2886,24 @@ pub fn run_all_with(
         ));
     }
     Ok(results)
+}
+
+/// Windows refusing a write under Program Files (or a folder the game's own
+/// installer left read-only) surfaces as `os error 5`, which reads like a bug
+/// in this tool. Say what it is and what to do.
+pub fn access_denied_hint(msg: &str, dir: &Path) -> String {
+    let denied = msg.contains("os error 5)")
+        || msg.contains("Access is denied")
+        || msg.contains("PermissionDenied");
+    if !denied {
+        return msg.to_owned();
+    }
+    format!(
+        "{msg}
+
+Windows refused to write in {}. Close the game, then right-click          dlss5oneclick.exe and Run as administrator — or take ownership of the game folder          (Properties → Security), or move the game out of Program Files.",
+        dir.display()
+    )
 }
 
 /// Convenience wrapper used by CLI / GUI when no explicit quality is passed —
@@ -2181,9 +2942,11 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
         d.join(game::FEEDER_MARKER),
         d.join(game::FEEDER_ADDON),
         d.join(game::DLSS5_ADDON),
+        d.join(game::DLSS5_ADDON_MARKER),
         d.join(game::DLSSNR_DLL),
         d.join(game::BRIDGE_ADDON),
         d.join(game::UPSTREAM_ADDON),
+        d.join(game::MFG_ADDON),
         d.join("dlss5-dx11-bridge.addon64"),
         shaders.join(game::FEEDER_FX),
         d.join("reshade-shaders")
@@ -2204,6 +2967,27 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     if d.join(game::DLSS_MARKER).is_file() {
         targets.push(d.join(game::DLSS_DLL));
     }
+    // The frame-generation provider: ours goes, and the game's own comes back
+    // from .original if we moved it aside (#90). The restore happens below,
+    // once `removed` exists, so it can be reported.
+    // dgVoodoo: only a copy this tool downloaded goes, and its conf only when
+    // this tool created it rather than merging into the user's own. Leaving it
+    // behind meant a DX9 game that would not start still would not start after
+    // Remove, with nothing naming the file responsible (#91).
+    if let Ok(m) = fs::read_to_string(d.join(game::DGVOODOO_MARKER)) {
+        targets.push(d.join("d3d9.dll"));
+        targets.push(d.join(game::DGVOODOO_MARKER));
+        if m.lines().any(|l| l.trim() == "conf-ours") {
+            targets.push(d.join(game::DGVOODOO_CONF));
+        }
+    }
+    let restore_dlssg = d.join(game::DLSSG_MARKER).is_file();
+    if restore_dlssg {
+        targets.push(d.join(game::DLSSG_MARKER));
+        if !d.join(game::DLSSG_BACKUP).is_file() {
+            targets.push(d.join(game::DLSSG_DLL));
+        }
+    }
     // 32-bit layout: the in-game addon32 and everything in host64\.
     targets.push(d.join(game::FEEDER_ADDON32));
     let host = d.join(game::HOST_DIR);
@@ -2211,6 +2995,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
         for f in [
             game::HOST_EXE,
             game::DLSS5_ADDON,
+            game::DLSS5_ADDON_MARKER,
             game::DLSSNR_DLL,
             game::DLSSNR_MARKER,
             game::DLSS_MARKER,
@@ -2224,12 +3009,10 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
             targets.push(host.join(game::RESHADE_PROXY));
             targets.push(host.join(game::RESHADE_MARKER));
         }
-        for n in [
-            "ReShade.ini",
-            "ReShade.log",
-            "dlss5-feed-host.log",
-            "ReShadePreset.ini",
-        ] {
+        // The two .log files are evidence, not installed files. Remove used to
+        // delete them, which erased the very verdict the next Install reads to
+        // decide which add-on build this machine can use (#69).
+        for n in ["ReShade.ini", "ReShadePreset.ini"] {
             targets.push(host.join(n));
         }
     }
@@ -2246,6 +3029,7 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
     }
     let mut removed = Vec::new();
     uninstall_opti(d, &mut removed)?;
+    uninstall_aio(d, &mut removed)?;
     for t in targets {
         if t.is_file() {
             fs::remove_file(&t)?;
@@ -2255,6 +3039,16 @@ pub fn uninstall(exe: &Path) -> Result<Vec<String>> {
                     .to_string_lossy()
                     .replace('\\', "/"),
             );
+        }
+    }
+    if restore_dlssg {
+        let backup = d.join(game::DLSSG_BACKUP);
+        let dll = d.join(game::DLSSG_DLL);
+        if backup.is_file() {
+            let _ = fs::remove_file(&dll);
+            if fs::rename(&backup, &dll).is_ok() {
+                removed.push(format!("{} (the game's own restored)", game::DLSSG_DLL));
+            }
         }
     }
     if include.is_dir() && fs::read_dir(&include)?.next().is_none() {
@@ -2404,9 +3198,35 @@ mod tests {
             ]}
         ]);
         assert_eq!(
-            pick_opti_zip(releases.as_array().unwrap()).as_deref(),
+            pick_opti_zip(releases.as_array().unwrap(), false).as_deref(),
             Some("https://x/good.zip")
         );
+        // A single zip serves either tick state.
+        assert_eq!(
+            pick_opti_zip(releases.as_array().unwrap(), true).as_deref(),
+            Some("https://x/good.zip")
+        );
+    }
+
+    /// v0.8.3 of the pre-SR fork ships a standard zip and an -rtx40-mfg one,
+    /// MFG listed first. The tick picks; nobody gets the unlock build by
+    /// accident of asset order.
+    #[test]
+    fn opti_mfg_variant_follows_the_tick() {
+        let releases = json!([
+            {"prerelease": false, "tag_name": "v0.8.3", "assets": [
+                {"name": "OptiScaler-NR-v0.8.3-rtx40-mfg.zip", "browser_download_url": "https://x/mfg.zip"},
+                {"name": "OptiScaler-NR-v0.8.3-rtx40-mfg.zip.sha256", "browser_download_url": "https://x/mfg.sha"},
+                {"name": "OptiScaler-NR-v0.8.3.zip", "browser_download_url": "https://x/std.zip"},
+                {"name": "OptiScaler-NR-v0.8.3.zip.sha256", "browser_download_url": "https://x/std.sha"}
+            ]}
+        ]);
+        let r = releases.as_array().unwrap();
+        assert_eq!(
+            pick_opti_zip(r, false).as_deref(),
+            Some("https://x/std.zip")
+        );
+        assert_eq!(pick_opti_zip(r, true).as_deref(), Some("https://x/mfg.zip"));
     }
 
     /// The engine choice decides which fork is fetched, and nothing else.
@@ -2450,6 +3270,378 @@ mod tests {
         let cfg = fs::read_to_string(d.join("dlss5-feed.cfg")).unwrap();
         assert!(cfg.contains("work_resolution=100"), "{cfg}");
         assert!(cfg.contains("work_upscale=0"), "{cfg}");
+    }
+
+    /// A machine whose own log carries the driver-fault verdict must not be
+    /// handed the same add-on build again. The evidence has to come from the
+    /// log, not from a driver number, because the measurement upstream covers
+    /// one driver and assumes the rest (#69).
+    /// On a 32-bit game the host writes that verdict into host64\ while the
+    /// feed's own log sits beside the exe. Reading only one folder missed it,
+    /// and the exclusion of 32-bit games on top of that meant GTA IV was handed
+    /// the faulting build every single install (#69).
+    #[test]
+    fn the_driver_verdict_is_found_from_either_side_of_a_32_bit_layout() {
+        let t = tempfile::tempdir().unwrap();
+        let game = t.path();
+        let host = game.join(game::HOST_DIR);
+        fs::create_dir_all(&host).unwrap();
+        let flag = t.path().join("state").join("driver-fault.txt");
+        let faulted = |dir: &Path| faulted_in_driver_at(dir, &flag, Some("616.64".to_owned()));
+        assert!(!faulted(&host));
+
+        // The host's own log, which is where a 32-bit game records it.
+        fs::write(
+            host.join("dlss5-feed-host.log"),
+            "[host] WARNING: renodx-dlss5 v4.7 with NVIDIA driver 616.64 is a combination \
+             measured to fail\n",
+        )
+        .unwrap();
+        assert!(faulted(&host));
+
+        // And the feed's log beside the exe, one level up from the consumer dir.
+        let t2 = tempfile::tempdir().unwrap();
+        let host2 = t2.path().join(game::HOST_DIR);
+        fs::create_dir_all(&host2).unwrap();
+        fs::write(
+            t2.path().join("dlss5-feed.log"),
+            "[feed] WARNING: renodx-dlss5 v4.7 with NVIDIA driver 616.64 is a combination \
+             measured to fail\n",
+        )
+        .unwrap();
+        assert!(faulted(&host2));
+    }
+
+    /// Remove deletes the game folder's logs, and a fresh game has none yet, so
+    /// a verdict read out of a log has to outlive the folder it was read in.
+    /// sempie27 was told to Remove and Install, which erased the evidence and
+    /// handed him the faulting build again (#69).
+    #[test]
+    fn the_driver_verdict_outlives_the_folder_it_was_read_in() {
+        let t = tempfile::tempdir().unwrap();
+        let host = t.path().join(game::HOST_DIR);
+        fs::create_dir_all(&host).unwrap();
+        let flag = t.path().join("state").join("driver-fault.txt");
+        let drv = || Some("616.64".to_owned());
+
+        assert!(!faulted_in_driver_at(&host, &flag, drv()));
+
+        fs::write(
+            host.join("dlss5-feed-host.log"),
+            "[host] WARNING: renodx-dlss5 v4.7 with NVIDIA driver 616.64 is a combination \
+             measured to fail\n",
+        )
+        .unwrap();
+        assert!(faulted_in_driver_at(&host, &flag, drv()));
+        assert_eq!(fs::read_to_string(&flag).unwrap().trim(), "616.64");
+
+        // Remove empties the folder; the verdict survives it.
+        fs::remove_file(host.join("dlss5-feed-host.log")).unwrap();
+        assert!(
+            faulted_in_driver_at(&host, &flag, drv()),
+            "the verdict must outlive the log"
+        );
+
+        // A driver update retires it, and the stale flag is dropped.
+        assert!(!faulted_in_driver_at(
+            &host,
+            &flag,
+            Some("620.10".to_owned())
+        ));
+        assert!(!flag.is_file());
+    }
+
+    #[test]
+    fn a_driver_fault_in_the_log_pins_the_classic_addon() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let flag = t.path().join("state").join("driver-fault.txt");
+        let faulted = |dir: &Path| faulted_in_driver_at(dir, &flag, Some("616.64".to_owned()));
+        assert!(!faulted(d));
+
+        fs::write(
+            d.join("dlss5-feed-host.log"),
+            "[host] WARNING: renodx-dlss5 v4.7 with NVIDIA driver 616.64 is a combination \
+             measured to fail (on 616.64 exactly; anything newer is untested here). The neural \
+             evaluate faults inside the driver's own NGX runtime -- an access violation in \
+             D3D12Core.dll, reached through nvngx_dlssnr.dll\n",
+        )
+        .unwrap();
+        assert!(faulted(d));
+
+        // The feed's own log carries the same verdict on a 64-bit game.
+        let d2 = tempfile::tempdir().unwrap();
+        fs::write(
+            d2.path().join("dlss5-feed.log"),
+            "[feed] WARNING: renodx-dlss5 v4.7 with NVIDIA driver 616.64 is a combination \
+             measured to fail\n",
+        )
+        .unwrap();
+        assert!(faulted(d2.path()));
+
+        // A healthy log changes nothing.
+        let d3 = tempfile::tempdir().unwrap();
+        fs::write(d3.path().join("dlss5-feed.log"), "[feed] feature ready\n").unwrap();
+        let fresh = t.path().join("state2").join("driver-fault.txt");
+        assert!(!faulted_in_driver_at(
+            d3.path(),
+            &fresh,
+            Some("616.64".to_owned())
+        ));
+    }
+
+    /// Two neural consumers in one folder is not two implementations to choose
+    /// from: both detour the same NGX entry points and create feature 18 on the
+    /// same device, the second create is refused (0xBAD0000B), and the user gets
+    /// neither. Installing once with the default and again with Neural Upstream
+    /// left exactly that (#75).
+    #[test]
+    fn the_upstream_route_removes_the_addon_it_replaces() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), game::PE_X64);
+        fs::write(t.path().join(game::DLSS_DLL), b"x").unwrap(); // native DLSS
+        let addon = t.path().join(game::DLSS5_ADDON);
+        fs::write(&addon, b"addon").unwrap();
+        let st = game::inspect(&exe).unwrap();
+
+        // The step is in the plan for that route, and not for the default one.
+        let named = |v: Vec<Step>| -> Vec<&'static str> { v.iter().map(|s| s.name).collect() };
+        let with = named(plan_with(&st, Engine::ReShade, false, true));
+        let without = named(plan_with(&st, Engine::ReShade, false, false));
+        assert!(
+            with.iter().any(|n| n.contains("Remove the RenoDX")),
+            "{with:?}"
+        );
+        assert!(
+            !without.iter().any(|n| n.contains("Remove the RenoDX")),
+            "{without:?}"
+        );
+
+        // And it takes the file out.
+        let c = reqwest::blocking::Client::new();
+        step_dlss5_cleanup(&c, &st, t.path(), &|_, _| {}).unwrap();
+        assert!(!addon.exists());
+        // A second run is a no-op rather than an error.
+        step_dlss5_cleanup(&c, &st, t.path(), &|_, _| {}).unwrap();
+    }
+
+    /// Feeder 0.15.0 fixed the sRGB staging-view bug that made every reduced
+    /// work resolution fail. A failure logged by an older build must stop
+    /// holding the setting down, or the fix never reaches anyone who hit it
+    /// (DLSS5-Feeder#85).
+    #[test]
+    fn the_work_resolution_hold_expires_with_the_feeder_that_logged_it() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let log = |ver: &str| {
+            fs::write(
+                d.join("dlss5-feed.log"),
+                format!(
+                    "02:08:22.172  dlss5-feed {ver} (built Sep  7 2026 07:47:43) attached.\n\
+                     [feed] work-resolution staging SRV failed\n"
+                ),
+            )
+            .unwrap();
+        };
+
+        log("0.14.0-beta.5");
+        assert!(
+            !work_resolution_refused(d),
+            "an old build's failure is stale"
+        );
+        log("0.15.0");
+        assert!(
+            work_resolution_refused(d),
+            "the fixed build still failing counts"
+        );
+        log("0.16.2");
+        assert!(work_resolution_refused(d));
+
+        // A log with no version line at all is still taken at its word.
+        fs::write(
+            d.join("dlss5-feed.log"),
+            "[feed] work-resolution staging SRV failed\n",
+        )
+        .unwrap();
+        assert!(work_resolution_refused(d));
+    }
+
+    /// The 32-bit halves talk a versioned protocol; if one is refreshed and the
+    /// other is not, the host exits at startup and nothing says why from inside
+    /// the game. Same size is not the same release (#69).
+    #[test]
+    fn both_thirty_two_bit_halves_carry_the_tag_they_came_from() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let host = d.join(game::HOST_DIR);
+        fs::create_dir_all(&host).unwrap();
+
+        // What an install writes.
+        fs::write(d.join(game::FEEDER_MARKER), b"v0.15.1").unwrap();
+        fs::write(host.join(game::FEEDER_MARKER), b"v0.15.1").unwrap();
+        let agree = |tag: &str| {
+            let says = |dir: &Path| {
+                fs::read_to_string(dir.join(game::FEEDER_MARKER)).is_ok_and(|m| m.trim() == tag)
+            };
+            says(d) && says(&host)
+        };
+        assert!(agree("v0.15.1"));
+
+        // A newer release: neither half is current, so both are replaced.
+        assert!(!agree("v0.16.0"));
+
+        // The failure this fixes: the helper refreshed, the in-game half not.
+        fs::write(host.join(game::FEEDER_MARKER), b"v0.16.0").unwrap();
+        assert!(
+            !agree("v0.16.0"),
+            "a half-updated pair must not look current"
+        );
+    }
+
+    /// RTX 40 MFG is one ini key and no extra files, so it can be offered as
+    /// part of an install. The Ampere/Turing key in the same section sideloads
+    /// a DLL with no published release and is deliberately never written (#83).
+    /// Remove left dgVoodoo's d3d9.dll in every DX9 game it had been installed
+    /// into, so a game that would not start still would not start afterwards,
+    /// and nothing said which file to delete (#91). Only a copy this tool
+    /// downloaded goes, and the conf only when this tool created it.
+    #[test]
+    fn removing_takes_our_dgvoodoo_out_and_leaves_a_user_s_alone() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), game::PE_X64);
+
+        // Ours, conf included.
+        fs::write(d.join("d3d9.dll"), b"dgVoodoo").unwrap();
+        fs::write(d.join(game::DGVOODOO_CONF), b"[General]\n").unwrap();
+        fs::write(
+            d.join(game::DGVOODOO_MARKER),
+            format!("{DGVOODOO_TAG}\nconf-ours\n"),
+        )
+        .unwrap();
+        uninstall(&exe).unwrap();
+        assert!(!d.join("d3d9.dll").exists());
+        assert!(!d.join(game::DGVOODOO_CONF).exists());
+        assert!(!d.join(game::DGVOODOO_MARKER).exists());
+
+        // Ours, but the conf was the user's before we merged into it.
+        fs::write(d.join("d3d9.dll"), b"dgVoodoo").unwrap();
+        fs::write(d.join(game::DGVOODOO_CONF), b"[General]\n").unwrap();
+        fs::write(d.join(game::DGVOODOO_MARKER), format!("{DGVOODOO_TAG}\n")).unwrap();
+        uninstall(&exe).unwrap();
+        assert!(!d.join("d3d9.dll").exists());
+        assert!(d.join(game::DGVOODOO_CONF).is_file(), "their conf stays");
+
+        // Someone else's d3d9.dll, no marker: untouched.
+        fs::write(d.join("d3d9.dll"), b"theirs").unwrap();
+        uninstall(&exe).unwrap();
+        assert_eq!(fs::read(d.join("d3d9.dll")).unwrap(), b"theirs");
+    }
+
+    /// The MFG add-on validates the frame-generation provider by build and
+    /// refuses anything else, so ours goes in and the game's own is kept as
+    /// .original — Remove has to put that back, not delete it (#90).
+    #[test]
+    fn removing_the_mfg_provider_restores_the_game_s_own() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), game::PE_X64);
+        fs::write(d.join(game::DLSSG_DLL), b"ours").unwrap();
+        fs::write(d.join(game::DLSSG_BACKUP), b"the game's").unwrap();
+        fs::write(d.join(game::DLSSG_MARKER), b"dlssg-310.9.1").unwrap();
+
+        uninstall(&exe).unwrap();
+        assert_eq!(
+            fs::read(d.join(game::DLSSG_DLL)).unwrap(),
+            b"the game's",
+            "the game's provider must come back"
+        );
+        assert!(!d.join(game::DLSSG_BACKUP).exists());
+        assert!(!d.join(game::DLSSG_MARKER).exists());
+
+        // With no backup, ours is simply removed.
+        fs::write(d.join(game::DLSSG_DLL), b"ours").unwrap();
+        fs::write(d.join(game::DLSSG_MARKER), b"dlssg-310.9.1").unwrap();
+        uninstall(&exe).unwrap();
+        assert!(!d.join(game::DLSSG_DLL).exists());
+    }
+
+    /// The OptiScaler route writes an ini key; the ReShade route needs the
+    /// separate add-on, because the fork's built-in unlock reported "DLSSG not
+    /// patched: capability not matched" on the reporter's machine (#83). The
+    /// add-on is an .addon64, so a 32-bit game never gets it.
+    #[test]
+    fn mfg_addon_is_planned_on_the_reshade_route_only() {
+        let st = game::stub_status(game::Mode::Native, game::Api::Dx12);
+        let named = |v: &[Step]| -> Vec<&'static str> { v.iter().map(|s| s.name).collect() };
+
+        std::env::remove_var(ADA_MFG_ENV);
+        assert!(!named(&plan_with(&st, Engine::ReShade, false, false)).contains(&STEP_MFG.name));
+
+        std::env::set_var(ADA_MFG_ENV, "1");
+        let reshade = named(&plan_with(&st, Engine::ReShade, false, false));
+        assert!(reshade.contains(&STEP_MFG.name), "{reshade:?}");
+        // Ahead of ReShade config, which writes the add-on list.
+        let mfg = reshade.iter().position(|n| *n == STEP_MFG.name).unwrap();
+        let cfg = reshade.iter().position(|n| *n == STEP_CONFIG.name).unwrap();
+        assert!(mfg < cfg, "{reshade:?}");
+        // The OptiScaler route has its own ini key and must not fetch it.
+        assert!(!named(&plan_with(&st, Engine::Opti, false, false)).contains(&STEP_MFG.name));
+        std::env::remove_var(ADA_MFG_ENV);
+    }
+
+    #[test]
+    fn ada_mfg_is_written_and_ampere_is_left_alone() {
+        std::env::remove_var(ADA_MFG_ENV);
+        assert_eq!(ada_mfg(), "false");
+        std::env::set_var(ADA_MFG_ENV, "1");
+        assert_eq!(ada_mfg(), "true");
+        std::env::remove_var(ADA_MFG_ENV);
+
+        // The key lives under [DLSSG] in the shipped ini (v0.7.7 and the
+        // v0.8.3 -rtx40-mfg package alike); [FrameGen] holds Enabled/FGInput/
+        // FGOutput. Writing it under [FrameGen] was a silent no-op for three
+        // releases.
+        let ini =
+            "[FrameGen]\nEnabled=auto\n\n[DLSSG]\nAdaMfgUnlock=false\nAmpereMfgUnlock=false\n";
+        let out = set_ini_key(ini, "DLSSG", "AdaMfgUnlock", "true").unwrap();
+        assert!(out.contains("[DLSSG]\nAdaMfgUnlock=true"), "{out}");
+        assert!(
+            !out.contains("[FrameGen]\nEnabled=auto\nAdaMfgUnlock"),
+            "{out}"
+        );
+        // The two are mutually exclusive upstream: "Never combine with
+        // AdaMfgUnlock or an external MFG unlocker."
+        assert!(out.contains("AmpereMfgUnlock=false"), "{out}");
+    }
+
+    /// OptiScaler's own FSR 3.1 frame generation is four ini keys on files the
+    /// package already ships. Off means the ini is not touched, because the
+    /// overlay's own frame-generation choice lives there too.
+    #[test]
+    fn opti_fg_is_four_keys_and_off_is_untouched() {
+        std::env::remove_var(OPTI_FG_ENV);
+        assert!(!opti_fg());
+        std::env::set_var(OPTI_FG_ENV, "1");
+        assert!(opti_fg());
+        std::env::remove_var(OPTI_FG_ENV);
+
+        let ini =
+            "[FrameGen]\nEnabled=auto\nFGInput=auto\nFGOutput=auto\n\n[OptiFG]\nHUDFix=auto\n";
+        let mut cur = ini.to_owned();
+        for (section, key, value) in [
+            ("FrameGen", "Enabled", "true"),
+            ("FrameGen", "FGInput", "upscaler"),
+            ("FrameGen", "FGOutput", "fsrfg"),
+            ("OptiFG", "HUDFix", "true"),
+        ] {
+            cur = set_ini_key(&cur, section, key, value).unwrap();
+        }
+        assert!(
+            cur.contains("[FrameGen]\nEnabled=true\nFGInput=upscaler\nFGOutput=fsrfg"),
+            "{cur}"
+        );
+        assert!(cur.contains("[OptiFG]\nHUDFix=true"), "{cur}");
     }
 
     #[test]
@@ -2989,8 +4181,10 @@ RestoreComputeSignature=true
             reshade: Some("6.8.0".into()),
             feeder: Some("v0.13.1-beta.1".into()),
             opti: Some("v0.2.0-dlssnr".into()),
+            opti_presr: Some("v0.7.7".into()),
             dlss: Some("dlss-310.9.0".into()),
             dlssnr: Some("dlssnr-310.8.SF-v2".into()),
+            aio: None,
         };
         assert!(stale_components(d, &latest).is_empty());
 
@@ -3016,6 +4210,54 @@ RestoreComputeSignature=true
         assert!(stale_components(d, &latest)
             .iter()
             .any(|s| s == "OptiScaler unknown version → v0.2.0-dlssnr"));
+    }
+
+    /// The two builds number their releases independently, so the pre-SR fork's
+    /// v0.7.7 was compared against the stable build's v0.2.0-dlssnr and reported
+    /// an update on every single run, which Install could never clear (#88).
+    #[test]
+    fn the_presr_fork_is_compared_against_its_own_releases() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let latest = Latest {
+            reshade: None,
+            feeder: None,
+            opti: Some("v0.2.0-dlssnr".into()),
+            opti_presr: Some("v0.7.7".into()),
+            dlss: None,
+            dlssnr: None,
+            aio: None,
+        };
+
+        // Current pre-SR install: the repo line settles it.
+        fs::write(
+            d.join(game::OPTI_MANIFEST),
+            "# tag v0.7.7\n# repo wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass\ndxgi.dll\n",
+        )
+        .unwrap();
+        assert!(stale_components(d, &latest).is_empty());
+
+        // Behind on the pre-SR fork: named against that fork's newest.
+        fs::write(
+            d.join(game::OPTI_MANIFEST),
+            "# tag v0.7.6\n# repo wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass\ndxgi.dll\n",
+        )
+        .unwrap();
+        assert_eq!(
+            stale_components(d, &latest),
+            vec!["OptiScaler v0.7.6 → v0.7.7".to_string()]
+        );
+
+        // A manifest from before the repo line: the stable build's tags all end
+        // in "-dlssnr", so the shape of the tag says which build it is.
+        fs::write(d.join(game::OPTI_MANIFEST), "# tag v0.7.7\ndxgi.dll\n").unwrap();
+        assert!(stale_components(d, &latest).is_empty());
+        fs::write(
+            d.join(game::OPTI_MANIFEST),
+            "# tag v0.2.0-dlssnr\ndxgi.dll\n",
+        )
+        .unwrap();
+        assert!(stale_components(d, &latest).is_empty());
     }
 
     /// The manifest carries the tag on a comment line, and older manifests
@@ -3268,5 +4510,115 @@ RestoreComputeSignature=true
         )
         .unwrap_err();
         assert!(err.to_string().contains("64-bit only"));
+    }
+
+    /// The AIO is the whole consumer: no Feeder, no RenoDX add-on; the model
+    /// and NVIDIA's two runtimes beside it. Switching back
+    /// to the ReShade route removes it first, so ReShade never loads two
+    /// neural consumers on one frame.
+    #[test]
+    fn aio_route_is_reshade_plus_the_addon_and_runtimes_only() {
+        let named = |v: &[Step]| -> Vec<&'static str> { v.iter().map(|s| s.name).collect() };
+        let st = game::stub_status(game::Mode::Feeder, game::Api::Dx12);
+        let aio = named(&plan_with(&st, Engine::Aio, false, false));
+        assert_eq!(
+            aio,
+            vec![
+                STEP_RESHADE.name,
+                STEP_AIO.name,
+                STEP_DLSSNR_ONLY.name,
+                STEP_AIO_RUNTIME.name,
+                STEP_AIO_CONFIG.name,
+                STEP_GPU_PREF.name,
+            ]
+        );
+        let mut st = game::stub_status(game::Mode::Feeder, game::Api::Dx12);
+        assert!(
+            !named(&plan_with(&st, Engine::ReShade, false, false)).contains(&STEP_AIO_CLEANUP.name)
+        );
+        st.aio = true;
+        let back = named(&plan_with(&st, Engine::ReShade, false, false));
+        assert_eq!(back[1], STEP_AIO_CLEANUP.name, "{back:?}");
+    }
+
+    #[test]
+    fn uninstall_removes_aio_manifest_files_and_nothing_else() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        let exe = make_pe(&d.join("game.exe"), game::PE_X64);
+        let shaders = d.join("reshade-shaders").join("Shaders");
+        fs::create_dir_all(&shaders).unwrap();
+        fs::create_dir_all(d.join("licenses")).unwrap();
+        fs::write(d.join(game::AIO_ADDON), b"a").unwrap();
+        fs::write(d.join("nvngx.dll"), b"bridge").unwrap();
+        fs::write(shaders.join("DLSS5_AIO_Feed.fx"), b"fx").unwrap();
+        fs::write(shaders.join("Mine.fx"), b"keep").unwrap();
+        fs::write(d.join("licenses").join("NOTICE.txt"), b"n").unwrap();
+        fs::write(
+            d.join(game::AIO_MANIFEST),
+            format!(
+                "# tag v2.2.4\n# repo {AIO_REPO}\n{}\nnvngx.dll\nreshade-shaders/Shaders/DLSS5_AIO_Feed.fx\nlicenses/NOTICE.txt",
+                game::AIO_ADDON
+            ),
+        )
+        .unwrap();
+        let removed = uninstall(&exe).unwrap();
+        assert!(removed.iter().any(|r| r == game::AIO_ADDON), "{removed:?}");
+        assert!(!d.join(game::AIO_ADDON).exists());
+        assert!(!d.join("nvngx.dll").exists());
+        assert!(!shaders.join("DLSS5_AIO_Feed.fx").exists());
+        assert!(shaders.join("Mine.fx").exists());
+        assert!(!d.join("licenses").exists());
+        assert!(!d.join(game::AIO_MANIFEST).exists());
+        // With the add-on gone, uninstall_all sees no foreign add-on either.
+        let (_, kept) = uninstall_all(&exe).unwrap();
+        assert!(kept.is_none(), "{kept:?}");
+    }
+
+    #[test]
+    fn run_all_refuses_aio_on_32bit_before_network() {
+        let t = tempfile::tempdir().unwrap();
+        let exe = make_pe(&t.path().join("game.exe"), game::PE_X86);
+        let err = run_all_with(
+            &exe,
+            Engine::Aio,
+            false,
+            false,
+            InstallOpts {
+                quality: QualityChoice::Auto,
+                overrides: QualityOverrides::default(),
+            },
+            &|_, _| {},
+            &|_, _, _, _, _| {},
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("64-bit only"));
+    }
+
+    #[test]
+    fn access_denied_gets_a_run_as_administrator_hint() {
+        let d = Path::new(r"C:\Program Files\Game");
+        let hinted = access_denied_hint("failed to copy: Access is denied. (os error 5)", d);
+        assert!(hinted.contains("Run as administrator"), "{hinted}");
+        assert!(hinted.contains(r"C:\Program Files\Game"), "{hinted}");
+        let plain = access_denied_hint("no release found", d);
+        assert_eq!(plain, "no release found");
+    }
+
+    /// 4.70 unless asked otherwise: unset and empty pin the default, "latest"
+    /// lifts the pin, anything else is a tag of its own.
+    #[test]
+    fn renodx_default_is_4_70_and_latest_is_the_opt_in() {
+        assert_eq!(renodx_tag_choice(None).as_deref(), Some(RENODX_DEFAULT_TAG));
+        assert_eq!(
+            renodx_tag_choice(Some("")).as_deref(),
+            Some(RENODX_DEFAULT_TAG)
+        );
+        assert_eq!(renodx_tag_choice(Some("latest")), None);
+        assert_eq!(renodx_tag_choice(Some(" Latest ")), None);
+        assert_eq!(
+            renodx_tag_choice(Some(RENODX_CLASSIC_TAG)).as_deref(),
+            Some(RENODX_CLASSIC_TAG)
+        );
     }
 }
