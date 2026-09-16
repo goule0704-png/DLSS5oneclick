@@ -20,7 +20,7 @@ use eframe::egui::{
     self, Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Stroke, StrokeKind, Vec2,
 };
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
@@ -95,6 +95,12 @@ pub struct App {
     /// ReShade route: pin the classic DLSS 5 add-on build, which the Feeder's
     /// host measured to work on NVIDIA 616.64 where the current one faults (#69).
     renodx_classic: bool,
+    /// Ask for the newest DLSS 5 add-on build instead of the default 4.70.
+    renodx_newest: bool,
+    /// OptiScaler route, RTX 40 only: the fork's built-in MFG unlock (#83).
+    ada_mfg: bool,
+    /// OptiScaler route, D3D12, any RTX: FSR 3.1 frame generation (2X).
+    opti_fg: bool,
     renodx: RenodxLookup,
     renodx_rx: Option<Receiver<RenodxLookup>>,
     /// Exe the current lookup belongs to, so a refresh does not re-fetch.
@@ -256,6 +262,9 @@ impl App {
             upstream_preset: 3,
             opti_presr: false,
             renodx_classic: false,
+            renodx_newest: false,
+            ada_mfg: false,
+            opti_fg: false,
             renodx: RenodxLookup::Idle,
             renodx_rx: None,
             renodx_for: None,
@@ -341,6 +350,27 @@ impl App {
         if self.resolved_exe != self.renodx_for {
             self.renodx_for = self.resolved_exe.clone();
             self.renodx_on = false;
+            // The MFG tick belongs to the game, not to the session: a game that
+            // already has the add-on comes back ticked, so re-running Install
+            // does not silently drop it (#83). Remove takes the file away, and
+            // the tick follows it.
+            self.ada_mfg = matches!(&self.status, Some(Ok(s)) if s.mfg);
+            // Same for the add-on build ticks: the tag recorded beside the
+            // add-on says which build is in, so the ticks come back the way
+            // the last Install left them instead of clearing on every
+            // reselect (#101).
+            let tag = self
+                .status
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|s| {
+                    std::fs::read_to_string(s.consumer_dir().join(game::DLSS5_ADDON_MARKER)).ok()
+                })
+                .map(|t| t.trim().to_owned());
+            self.renodx_classic = tag.as_deref() == Some(installer::RENODX_CLASSIC_TAG);
+            self.renodx_newest = tag.as_deref().is_some_and(|t| {
+                t != installer::RENODX_CLASSIC_TAG && t != installer::RENODX_DEFAULT_TAG
+            });
             self.start_renodx_lookup();
         }
         self.reload_knobs_and_perf();
@@ -445,8 +475,20 @@ impl App {
         }
         if self.renodx_classic {
             std::env::set_var(installer::RENODX_TAG_ENV, installer::RENODX_CLASSIC_TAG);
+        } else if self.renodx_newest {
+            std::env::set_var(installer::RENODX_TAG_ENV, installer::RENODX_LATEST);
         } else {
             std::env::remove_var(installer::RENODX_TAG_ENV);
+        }
+        if self.ada_mfg {
+            std::env::set_var(installer::ADA_MFG_ENV, "1");
+        } else {
+            std::env::remove_var(installer::ADA_MFG_ENV);
+        }
+        if self.opti_fg {
+            std::env::set_var(installer::OPTI_FG_ENV, "1");
+        } else {
+            std::env::remove_var(installer::OPTI_FG_ENV);
         }
         std::env::set_var(
             installer::UPSTREAM_PRESET_ENV,
@@ -482,7 +524,10 @@ impl App {
                         }
                     )
                 })
-                .map_err(|e| format!("{e:#}"))
+                .map_err(|e| {
+                    let dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+                    installer::access_denied_hint(&format!("{e:#}"), &dir)
+                })
             } else {
                 let p_tx = tx.clone();
                 let s_tx = tx.clone();
@@ -506,6 +551,8 @@ impl App {
                 .map(|_| {
                     if engine == Engine::Opti {
                         lang::tr("Done. In game: Insert opens the OptiScaler overlay → enable Neural Rendering.", "完成。游戏中：按 Insert 打开 OptiScaler 覆盖层 → 启用神经渲染（默认关闭）。").to_owned()
+                    } else if engine == Engine::Aio {
+                        lang::tr("Done. In game: turn the game's own upscaling, anti-aliasing and frame generation off, run windowed; Home opens ReShade → Add-ons tab → Standalone DLSS-NR + SR.", "完成。游戏中：关闭游戏自带的上采样、抗锯齿与帧生成，并用窗口模式运行；按 Home 打开 ReShade → Add-ons 标签 → Standalone DLSS-NR + SR。").to_owned()
                     } else {
                         lang::tr("Done. In game: Home opens ReShade → Add-ons tab → DLSS 5 Neural Rendering → enable. (Home tab saying \"no effect files\" is normal on games with their own DLSS.)", "完成。游戏中：按 Home 打开 ReShade → Add-ons 标签页 → DLSS 5 Neural Rendering → 启用。（自带 DLSS 的游戏在 Home 标签页提示「无效果文件」是正常的。）").to_owned()
                     }
@@ -649,6 +696,8 @@ impl App {
             }
             self.engine = if st.opti {
                 Engine::Opti
+            } else if st.aio {
+                Engine::Aio
             } else {
                 Engine::ReShade
             };
@@ -761,6 +810,19 @@ impl App {
             }
             Err(e) => self.log.push(LogLine::Fail(format!("{e:#}"))),
         }
+    }
+
+    fn save_report(&mut self) {
+        let Some(exe) = self.exe() else { return };
+        self.log.clear();
+        self.progress_msg.clear();
+        self.log.push(match crate::report::write_bundle(&exe) {
+            Ok(p) => LogLine::Ok(format!(
+                "Report written: {} — attach that zip to the GitHub issue.",
+                p.display()
+            )),
+            Err(e) => LogLine::Fail(format!("{e:#}")),
+        });
     }
 
     fn pump_update(&mut self) {
@@ -882,6 +944,20 @@ const TILE_FEEDER32: Tile = Tile {
     optional: false,
 };
 
+const TILE_AIO: Tile = Tile {
+    title: "Standalone AIO \u{00b7} experimental",
+    detail: "standalone-dlssnr.addon64 + nvngx.dll (kibblerz) \u{00b7} nvngx_dlssnr.dll",
+    ok: |s| s.aio && s.dlssnr,
+    optional: false,
+};
+
+const TILE_AIO_RUNTIME: Tile = Tile {
+    title: "NVIDIA runtimes",
+    detail: "nvngx_dlss.dll \u{00b7} nvngx_dlssg.dll for frame generation",
+    ok: |s| s.dlss,
+    optional: false,
+};
+
 const TILE_OPTI: Tile = Tile {
     title: "OptiScaler + NR pass",
     title_zh: "OptiScaler + NR 通道",
@@ -974,6 +1050,30 @@ const TILE_REFRAMEWORK: Tile = Tile {
     optional: false,
 };
 
+/// Shortens `text` until it measures within `max_w`, ending in an ellipsis.
+///
+/// egui will happily wrap a long title onto a second line that the caption has
+/// no room for, and the clip rect then cuts that line through the middle of the
+/// letters. One line that says it was shortened is honest; half a line is not.
+fn truncate_to_fit(text: &str, max_w: f32, measure: impl Fn(&str) -> f32) -> String {
+    if measure(text) <= max_w {
+        return text.to_owned();
+    }
+    let mut end = text.len();
+    while end > 0 {
+        // Step back to a character boundary, never into the middle of one.
+        end -= 1;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let candidate = format!("{}\u{2026}", text[..end].trim_end());
+        if measure(&candidate) <= max_w {
+            return candidate;
+        }
+    }
+    String::new()
+}
+
 fn tiles_for(
     st: Option<&GameStatus>,
     engine: Engine,
@@ -994,6 +1094,9 @@ fn tiles_for(
 }
 
 fn base_tiles(st: Option<&GameStatus>, engine: Engine, upstream_on: bool) -> Vec<&'static Tile> {
+    if engine == Engine::Aio || st.is_some_and(|s| s.aio && !s.opti) {
+        return vec![&TILES_NATIVE[1], &TILE_AIO, &TILE_AIO_RUNTIME];
+    }
     match st.map(|s| s.mode) {
         Some(game::Mode::Native) if engine == Engine::Opti || st.is_some_and(|s| s.opti) => {
             vec![&TILES_NATIVE[0], &TILE_OPTI, &TILE_OPTI_MODEL]
@@ -1087,7 +1190,17 @@ fn engine_card(
         lang::tr("UNAVAILABLE", "不可用")
     };
     let pill_font = t::plex_semibold(10.0);
-    let galley = painter.layout_no_wrap(pill_text.to_owned(), pill_font, t::BG);
+    // The colour is baked into the galley at layout time; the one passed to
+    // painter.galley() is only a fallback. Laying out in BG and "recolouring"
+    // later drew CHOOSE in the background colour on every build so far (#77).
+    let pill_color = if selected {
+        t::BG
+    } else if enabled {
+        t::TEXT_SOFT
+    } else {
+        t::TEXT_DIM
+    };
+    let galley = painter.layout_no_wrap(pill_text.to_owned(), pill_font, pill_color);
     let pill = egui::Rect::from_min_size(
         egui::pos2(rect.right() - galley.size().x - 32.0, rect.top() + 12.0),
         galley.size() + Vec2::new(20.0, 8.0),
@@ -1112,7 +1225,8 @@ fn engine_card(
         painter.galley(
             pill.min + Vec2::new(10.0, 4.0),
             galley,
-            if enabled { t::TEXT_OFF } else { t::TEXT_DIM },
+            // TEXT_OFF on the tile fill was barely legible (#77).
+            if enabled { t::TEXT_SOFT } else { t::TEXT_DIM },
         );
     }
 
@@ -1569,21 +1683,36 @@ impl App {
             p.rect_filled(band, CornerRadius::ZERO, Color32::from_black_alpha(170));
             let mut x = band.left() + 10.0;
             let dlss_label = if m.has_dlss { lang::tr("DLSS own", "自带 DLSS") } else { lang::tr("no DLSS", "无 DLSS") };
+            // A game nothing has been done to has no third state to report, and
+            // an em dash on its own read as a rendering fault rather than as
+            // "not installed" (#77).
             let ready_label = if !m.stale.is_empty() {
-                lang::tr("stale", "待更新")
+                Some(lang::tr("stale", "待更新"))
             } else if m.ready {
-                lang::tr("ready", "就绪")
+                Some(lang::tr("ready", "就绪"))
             } else if m.installed {
-                lang::tr("partial", "部分安装")
+                Some(lang::tr("partial", "部分安装"))
             } else {
-                "—"
+                None
             };
             for (on, label) in [
-                (m.has_dlss, dlss_label),
-                (m.addon || m.installed, m.engine_path),
+                (m.has_dlss, Some(dlss_label)),
+                (m.addon || m.installed, Some(m.engine_path)),
                 (m.ready && m.stale.is_empty(), ready_label),
             ] {
+                let Some(label) = label else { continue };
                 let cy = band.center().y;
+                // Three labels do not always fit the poster's width, and the
+                // last one ran out past the card's border rather than being
+                // dropped (#77). The dots are a summary; a summary that
+                // overflows is worse than a shorter one.
+                let w = p
+                    .layout_no_wrap(label.to_owned(), t::plex_medium(10.5), t::TEXT_SOFT)
+                    .size()
+                    .x;
+                if x + 11.0 + w > band.right() - 6.0 {
+                    break;
+                }
                 p.circle_filled(
                     egui::pos2(x + 3.0, cy),
                     3.0,
@@ -1616,11 +1745,19 @@ impl App {
         );
         store_mark(ui, &self.store_icons, mark, g.store, t::TEXT_OFF);
         let title_x = mark.right() + 7.0;
-        let title = p.layout(
-            g.title.clone(),
+        // The title used to wrap to two lines and then have the second line
+        // sliced in half by the caption's clip rect, which reads as the text
+        // being cut off mid-word — because it is (#77). One line, ellipsis.
+        let avail = cap.right() - title_x - 8.0;
+        let measure = |t: &str| {
+            p.layout_no_wrap(t.to_owned(), t::plex_medium(12.0), t::TEXT)
+                .size()
+                .x
+        };
+        let title = p.layout_no_wrap(
+            truncate_to_fit(&g.title, avail, measure),
             t::plex_medium(12.0),
             t::TEXT,
-            cap.right() - title_x - 8.0,
         );
         let clip = egui::Rect::from_min_max(cap.min, egui::pos2(cap.right(), cap.bottom() - 4.0));
         ui.painter().with_clip_rect(clip).galley(
@@ -2175,7 +2312,7 @@ impl eframe::App for App {
         };
 
         // A Vulkan game blocks the ReShade engine only; OptiScaler reaches it (#46).
-        if self.engine == Engine::ReShade {
+        if self.engine != Engine::Opti {
             if let Some(p) = ok_status
                 .as_ref()
                 .and_then(game::GameStatus::reshade_engine_problem)
@@ -2319,54 +2456,65 @@ impl eframe::App for App {
                         {
                             ui.ctx().open_url(egui::OpenUrl::new_tab(KOFI_URL));
                         }
+                        // In a narrow window these used to be drawn over the
+                        // page tabs — "About" and "Ready" on the same pixels.
+                        // Decoration goes first, the tabs stay reachable (#64).
                         // ── language switch ───────────────────────
-                        let lang_label = match lang::get() {
-                            lang::Lang::Zh => "EN",
-                            lang::Lang::En => "中文",
-                        };
-                        let lang_btn = egui::Button::new(
-                            RichText::new(lang_label)
-                                .font(t::plex_medium(12.5))
-                                .color(t::TEXT_OFF),
-                        )
-                        .fill(Color32::TRANSPARENT)
-                        .stroke(Stroke::new(1.0, t::BORDER_STRONG))
-                        .corner_radius(CornerRadius::same(8))
-                        .min_size(Vec2::new(54.0, 30.0));
-                        if ui
-                            .add(lang_btn)
-                            .on_hover_text("界面语言 / Language")
-                            .clicked()
-                        {
-                            let next = match lang::get() {
-                                lang::Lang::Zh => lang::Lang::En,
-                                lang::Lang::En => lang::Lang::Zh,
+                        if ui.available_width() > 60.0 {
+                            let lang_label = match lang::get() {
+                                lang::Lang::Zh => "EN",
+                                lang::Lang::En => "中文",
                             };
-                            self.lang = next;
-                            lang::set(next);
-                            ui.ctx().request_repaint();
+                            let lang_btn = egui::Button::new(
+                                RichText::new(lang_label)
+                                    .font(t::plex_medium(12.5))
+                                    .color(t::TEXT_OFF),
+                            )
+                            .fill(Color32::TRANSPARENT)
+                            .stroke(Stroke::new(1.0, t::BORDER_STRONG))
+                            .corner_radius(CornerRadius::same(8))
+                            .min_size(Vec2::new(54.0, 30.0));
+                            if ui
+                                .add(lang_btn)
+                                .on_hover_text("界面语言 / Language")
+                                .clicked()
+                            {
+                                let next = match lang::get() {
+                                    lang::Lang::Zh => lang::Lang::En,
+                                    lang::Lang::En => lang::Lang::Zh,
+                                };
+                                self.lang = next;
+                                lang::set(next);
+                                ui.ctx().request_repaint();
+                            }
                         }
-                        chip(
-                            ui,
-                            concat!("v", env!("CARGO_PKG_VERSION")),
-                            t::TEXT_DIM,
-                            false,
-                        );
-                        chip(ui, lang::tr("LEAKED BUILD", "泄露版"), t::ACCENT, true);
-                        let (r, _) =
-                            ui.allocate_exact_size(Vec2::new(64.0, 20.0), egui::Sense::hover());
-                        ui.painter().circle_filled(
-                            r.left_center() + Vec2::new(5.0, 0.0),
-                            3.5,
-                            t::ACCENT,
-                        );
-                        ui.painter().text(
-                            r.left_center() + Vec2::new(14.0, 0.0),
-                            egui::Align2::LEFT_CENTER,
-                            lang::tr("Ready", "就绪"),
-                            t::plex_semibold(12.0),
-                            t::TEXT,
-                        );
+                        if ui.available_width() > 90.0 {
+                            chip(
+                                ui,
+                                concat!("v", env!("CARGO_PKG_VERSION")),
+                                t::TEXT_DIM,
+                                false,
+                            );
+                        }
+                        if ui.available_width() > 130.0 {
+                            chip(ui, lang::tr("LEAKED BUILD", "泄露版"), t::ACCENT, true);
+                        }
+                        if ui.available_width() > 64.0 {
+                            let (r, _) =
+                                ui.allocate_exact_size(Vec2::new(64.0, 20.0), egui::Sense::hover());
+                            ui.painter().circle_filled(
+                                r.left_center() + Vec2::new(5.0, 0.0),
+                                3.5,
+                                t::ACCENT,
+                            );
+                            ui.painter().text(
+                                r.left_center() + Vec2::new(14.0, 0.0),
+                                egui::Align2::LEFT_CENTER,
+                                lang::tr("Ready", "就绪"),
+                                t::plex_semibold(12.0),
+                                t::TEXT,
+                            );
+                        }
                     });
                 });
             });
@@ -2516,7 +2664,12 @@ impl eframe::App for App {
                 )
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
+                        // The button is drawn after the text but sits on top of
+                        // it: reserve its width first, or the wrapped last line
+                        // runs underneath it (#77).
+                        let tip_w = (ui.available_width() - 92.0).max(120.0);
                         ui.vertical(|ui| {
+                            ui.set_max_width(tip_w);
                             ui.label(
                                 RichText::new(lang::tr("Quick tip", "小贴士"))
                                     .font(t::plex_semibold(13.0))
@@ -2556,7 +2709,12 @@ impl eframe::App for App {
                         return;
                     }
                     Page::Settings => {
-                        self.settings_page(ui);
+                        // Same fix Setup got: on a 768 px screen the Save /
+                        // Apply / Reset row is below the edge, and there was no
+                        // way to reach it (#64).
+                        egui::ScrollArea::both()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| self.settings_page(ui));
                         return;
                     }
                     Page::About => {
@@ -2601,12 +2759,15 @@ impl eframe::App for App {
                 }
                 // Everything below scrolls: on a 768 px-tall screen the button row
                 // and the log fell off the bottom with no way to reach them (#64).
-                egui::ScrollArea::vertical()
+                egui::ScrollArea::both()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 12.0;
-                // The setup panel was designed at 720 px; keep it from stretching.
+                // The setup panel was designed at 720 px; keep it from stretching,
+                // and give it that width to lay out in even when the window is
+                // narrower — the scroll area is what makes the rest reachable (#64).
                 ui.set_max_width(860.0);
+                ui.set_min_width(720.0);
 
                 // ── path row ──────────────────────────────────────
                 ui.horizontal(|ui| {
@@ -2718,6 +2879,33 @@ impl eframe::App for App {
                                 game::set_mode_override(choice);
                                 self.inspect_resolved();
                             }
+                            // API: same idea. Unknown is assumed DX12, and a
+                            // DX11 game read that way never gets the bridge.
+                            let mut api = game::api_override();
+                            let api_name = |a: Option<game::Api>| match a {
+                                None => match s.api_detected {
+                                    game::Api::Unknown => "Auto: API unknown, assuming DX12",
+                                    game::Api::Dx11 => "Auto: DX11",
+                                    game::Api::Dx12 => "Auto: DX12",
+                                    game::Api::Dx9 => "Auto: DX9",
+                                    game::Api::Dx10 => "Auto: DX10",
+                                    game::Api::Vulkan => "Auto: Vulkan",
+                                },
+                                Some(game::Api::Dx11) => "Force DX11",
+                                Some(_) => "Force DX12",
+                            };
+                            let api_before = api;
+                            egui::ComboBox::from_id_salt("api_pick")
+                                .selected_text(RichText::new(api_name(api)).font(t::plex(12.0)).color(t::TEXT_SOFT))
+                                .show_ui(ui, |ui| {
+                                    for a in [None, Some(game::Api::Dx11), Some(game::Api::Dx12)] {
+                                        ui.selectable_value(&mut api, a, api_name(a));
+                                    }
+                                });
+                            if api != api_before && !self.running {
+                                game::set_api_override(api);
+                                self.inspect_resolved();
+                            }
                         }
                     });
                 }
@@ -2802,13 +2990,54 @@ impl eframe::App for App {
                     let cb = egui::Checkbox::new(
                         &mut on,
                         RichText::new(
-                            lang::tr("Black screen, crash or driver reset with DLSS 5 on? Install the classic add-on build (4.55)", "开启 DLSS 5 后黑屏、崩溃或驱动重置？请安装经典附加组件版本（4.55）"),
+                            lang::tr("Black screen, crash, driver reset, or worse image than before? Install the classic add-on build (4.55)", "开启 DLSS 5 后黑屏、崩溃、驱动重置，或画面比之前更差？请安装经典附加组件版本（4.55）"),
                         )
                         .font(t::plex(11.5))
                         .color(t::TEXT_SOFT),
                     );
                     if ui.add_enabled(!self.running, cb).changed() {
                         self.renodx_classic = on;
+                    }
+                    // The default is 4.70; the newest rhi-repo build is the
+                    // opt-in since 5.2.1 broke four games in three days.
+                    let mut newest = self.renodx_newest;
+                    let cb = egui::Checkbox::new(
+                        &mut newest,
+                        RichText::new(
+                            "Try the newest add-on build (5.2.1 or later) instead of the default 4.70 \u{2014} multi-pass sliders, new colour codec; crashes or blown-out colours reported in some games",
+                        )
+                        .font(t::plex(11.5))
+                        .color(t::TEXT_SOFT),
+                    );
+                    if ui
+                        .add_enabled(!self.running && !self.renodx_classic, cb)
+                        .changed()
+                    {
+                        self.renodx_newest = newest;
+                    }
+                }
+                // RTX 40 multi-frame generation on the ReShade route: a single
+                // MIT add-on, in-memory only. OptiScaler's own built-in unlock
+                // reported "DLSSG not patched: capability not matched" on the
+                // reporter's machine while this one reached 6X (#83).
+                if self.engine == Engine::ReShade
+                    && ok_status.as_ref().is_some_and(|s| !s.is32())
+                    && ok_status
+                        .as_ref()
+                        .and_then(|s| s.gpu.as_ref())
+                        .is_some_and(|(_, t)| *t == crate::gpu::Tier::Rtx40)
+                {
+                    let mut on = self.ada_mfg;
+                    let cb = egui::Checkbox::new(
+                        &mut on,
+                        RichText::new(
+                            "Unlock RTX 40 multi-frame generation (3X and above, up to 6X) — the game must have frame generation of its own",
+                        )
+                        .font(t::plex(11.5))
+                        .color(t::TEXT_SOFT),
+                    );
+                    if ui.add_enabled(!self.running, cb).changed() {
+                        self.ada_mfg = on;
                     }
                 }
                 if let Some(ac) = ok_status.as_ref().and_then(|s| s.anticheat) {
@@ -2824,7 +3053,15 @@ impl eframe::App for App {
 
                 // ── engine chooser ───────────────────────────────
                 let native = ok_status.as_ref().is_some_and(|s| s.mode == game::Mode::Native);
-                if !native {
+                if !native && self.engine == Engine::Opti {
+                    self.engine = Engine::ReShade;
+                }
+                // The AIO is a 64-bit ReShade add-on: no 32-bit build is wired
+                // here, and ReShade cannot reach a Vulkan game from dxgi.dll.
+                let aio_ok = ok_status
+                    .as_ref()
+                    .is_some_and(|s| !s.is32() && s.reshade_engine_problem().is_none());
+                if !aio_ok && self.engine == Engine::Aio {
                     self.engine = Engine::ReShade;
                 }
                 ui.horizontal(|ui| {
@@ -2836,9 +3073,9 @@ impl eframe::App for App {
                     );
                     ui.label(
                         RichText::new(if native {
-                            lang::tr("— two ways to run DLSS 5 in this game, pick one", "—— 在此游戏中运行 DLSS 5 有两种方式，请选其一")
+                            lang::tr("— three ways to run DLSS 5 in this game, pick one", "—— 在此游戏中运行 DLSS 5 有三种方式，请选其一")
                         } else {
-                            lang::tr("— this game has no DLSS of its own, so only the ReShade path can work", "—— 此游戏本身没有 DLSS，因此只能使用 ReShade 方式")
+                            lang::tr("— this game has no DLSS of its own: the ReShade path, or the standalone AIO", "—— 此游戏本身没有 DLSS：只能走 ReShade 方式，或使用独立的 AIO")
                         })
                         .font(t::plex(11.0))
                         .color(t::TEXT_DIM),
@@ -2846,9 +3083,17 @@ impl eframe::App for App {
                 });
                 {
                     let gap = 8.0;
-                    let card_h = 74.0;
                     let row_w = ui.available_width();
-                    let col_w = ((row_w - gap) / 2.0).floor();
+                    // Three cards on one row when the window is wide enough
+                    // for their text; a full-width third card below otherwise.
+                    // The wide card left half the row empty (#77).
+                    // Each card needs about 480 px for its two lines beside
+                    // the pill; at 1172 px three-up wrapped the third card's
+                    // text past its bottom edge (#77).
+                    let three_up = row_w >= 1500.0;
+                    let cols = if three_up { 3.0 } else { 2.0 };
+                    let card_h = 74.0;
+                    let col_w = ((row_w - gap * (cols - 1.0)) / cols).floor();
                     let (row_rect, _) =
                         ui.allocate_exact_size(Vec2::new(row_w, card_h), egui::Sense::hover());
                     let left = egui::Rect::from_min_size(row_rect.min, Vec2::new(col_w, card_h));
@@ -2881,6 +3126,39 @@ impl eframe::App for App {
                         },
                     ) {
                         self.engine = Engine::Opti;
+                    }
+                    let row2 = if three_up {
+                        egui::Rect::from_min_size(
+                            egui::pos2(row_rect.left() + (col_w + gap) * 2.0, row_rect.top()),
+                            Vec2::new(col_w, card_h),
+                        )
+                    } else {
+                        // Half width like the two above it: a full-width third
+                        // card was mostly empty (#77).
+                        ui.add_space(gap);
+                        let (r, _) = ui
+                            .allocate_exact_size(Vec2::new(row_w, card_h), egui::Sense::hover());
+                        egui::Rect::from_min_size(r.min, Vec2::new(col_w, card_h))
+                    };
+                    if engine_card(
+                        ui,
+                        row2,
+                        self.engine == Engine::Aio,
+                        aio_ok,
+                        "ReShade + standalone AIO \u{00b7} experimental",
+                        &[
+                            "kibblerz's all-in-one: neural rendering, super resolution, frame generation.",
+                            "In game: Home \u{2192} Add-ons \u{2192} Standalone DLSS-NR + SR. Windowed mode recommended.",
+                        ],
+                        if aio_ok {
+                            ""
+                        } else if ok_status.as_ref().is_some_and(|s| s.is32()) {
+                            "64-bit games only."
+                        } else {
+                            "Needs a game ReShade can reach from dxgi.dll."
+                        },
+                    ) {
+                        self.engine = Engine::Aio;
                     }
                 }
                 if self.engine == Engine::Opti {
@@ -2925,6 +3203,51 @@ impl eframe::App for App {
                         .font(t::plex(11.0))
                         .color(t::TEXT_DIM),
                     );
+                    // RTX 40 only: the 50 series has multi-frame generation of
+                    // its own, and the Ampere/Turing unlock in the same ini
+                    // needs a DLL nobody publishes, so it is not offered (#83).
+                    if self.opti_presr
+                        && ok_status
+                            .as_ref()
+                            .and_then(|s| s.gpu.as_ref())
+                            .is_some_and(|(_, t)| *t == crate::gpu::Tier::Rtx40)
+                    {
+                        ui.add_space(6.0);
+                        let mut on = self.ada_mfg;
+                        let cb = egui::Checkbox::new(
+                            &mut on,
+                            RichText::new(
+                                "RTX 40 multi-frame generation \u{2014} built into this build, no extra files. The game must have frame generation of its own.",
+                            )
+                            .font(t::plex(11.5))
+                            .color(t::TEXT_SOFT),
+                        );
+                        if ui.add_enabled(!self.running, cb).changed() {
+                            self.ada_mfg = on;
+                        }
+                    }
+                    // OptiScaler's own frame generation, any RTX card. The FSR
+                    // 3.1 libraries ship in the package already, so this is ini
+                    // keys and nothing to fetch. D3D12 only: every FG output in
+                    // that ini is a D3D12 component.
+                    if ok_status
+                        .as_ref()
+                        .is_some_and(|s| matches!(s.api, game::Api::Dx12 | game::Api::Unknown))
+                    {
+                        ui.add_space(6.0);
+                        let mut on = self.opti_fg;
+                        let cb = egui::Checkbox::new(
+                            &mut on,
+                            RichText::new(
+                                "Frame generation (2X, FSR 3.1 inside OptiScaler) \u{2014} any RTX card. Turn the game's own frame generation off; expect added latency.",
+                            )
+                            .font(t::plex(11.5))
+                            .color(t::TEXT_SOFT),
+                        );
+                        if ui.add_enabled(!self.running, cb).changed() {
+                            self.opti_fg = on;
+                        }
+                    }
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
@@ -3107,7 +3430,9 @@ impl eframe::App for App {
                             });
                     }
                 }
-                ui.add_space(2.0);
+                // The engine card's own border ended flush against this
+                // heading, which read as the two touching (#77).
+                ui.add_space(12.0);
 
                 // ── component list (status, not controls) ────────
                 ui.label(
@@ -3210,6 +3535,22 @@ impl eframe::App for App {
                     {
                         self.run_diagnose();
                     }
+                    let report = egui::Button::new(
+                        RichText::new("Save report").font(t::plex_medium(13.0)).color(t::TEXT_OFF),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::new(1.0, t::BORDER_STRONG))
+                    .corner_radius(CornerRadius::same(8))
+                    .min_size(Vec2::new(110.0, 42.0));
+                    if ui
+                        .add_enabled(ok_status.is_some() && !self.running, report)
+                        .on_hover_text(
+                            "Writes one zip to your Desktop with this game's logs, inis, folder listing and Diagnose output — attach it to a GitHub issue.",
+                        )
+                        .clicked()
+                    {
+                        self.save_report();
+                    }
                     let vulkan = ok_status
                         .as_ref()
                         .is_some_and(|s| s.api == game::Api::Vulkan);
@@ -3248,11 +3589,17 @@ impl eframe::App for App {
                             }
                         }
                     }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let missing = ok_status
-                            .as_ref()
-                            .map(installer::missing_install_files)
-                            .unwrap_or_default();
+                });
+                // The status line used to sit in a right-to-left layout on the
+                // button row. "Incomplete: missing <every file>" does not wrap
+                // there: it ran leftwards straight over Install, Remove and
+                // Diagnose, took the clicks, and pushed a horizontal scrollbar
+                // onto the page (#77). Its own row, wrapped, cannot do that.
+                {
+                    let missing = ok_status
+                        .as_ref()
+                        .map(installer::missing_install_files)
+                        .unwrap_or_default();
                         let stale = self
                             .exe()
                             .and_then(|e| {
@@ -3282,9 +3629,16 @@ impl eframe::App for App {
                         } else {
                             t::ACCENT
                         };
-                        ui.label(RichText::new(msg).font(t::plex_medium(12.0)).color(color));
-                    });
-                });
+                    if !msg.is_empty() {
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(msg).font(t::plex_medium(12.0)).color(color),
+                            )
+                            .wrap(),
+                        );
+                    }
+                }
 
                 // Offline knobs / expected FPS from Feeder perf log.
                 self.knobs_panel(ui);
@@ -3436,7 +3790,7 @@ pub fn run() -> eframe::Result {
         // title bar are gone, so a 620 px floor left the window unshrinkable there
         // and the buttons unreachable (#64). Everything scrolls now, so this can go
         // as small as the layout itself needs.
-        .with_min_inner_size([880.0, 420.0])
+        .with_min_inner_size([640.0, 420.0])
         .with_title(concat!("DLSS5oneclick ", env!("CARGO_PKG_VERSION")));
     if let Some(icon) = logo::icon_data() {
         viewport = viewport.with_icon(icon);
@@ -3456,6 +3810,28 @@ pub fn run() -> eframe::Result {
 mod tests {
     use super::*;
     use crate::game::{stub_status, Api, Mode};
+
+    /// A long game title used to wrap and then get sliced by the caption's
+    /// clip rect, so it read as cut off mid-word. Shorten it honestly (#77).
+    #[test]
+    fn a_long_title_is_shortened_with_an_ellipsis() {
+        // Fake metrics: every character is 10 wide.
+        let measure = |t: &str| t.chars().count() as f32 * 10.0;
+
+        assert_eq!(truncate_to_fit("Spore", 100.0, measure), "Spore");
+
+        let long = "The Witcher 3: Wild Hunt - Game of the Year Edition";
+        let out = truncate_to_fit(long, 100.0, measure);
+        assert!(out.ends_with('\u{2026}'), "{out}");
+        assert!(measure(&out) <= 100.0, "{out}");
+        assert!(long.starts_with(out.trim_end_matches('\u{2026}')), "{out}");
+
+        // Multi-byte titles must not be cut through a character.
+        let jp = "ファイナルファンタジー";
+        let out = truncate_to_fit(jp, 45.0, measure);
+        assert!(measure(&out) <= 45.0, "{out}");
+        assert!(jp.starts_with(out.trim_end_matches('\u{2026}')), "{out}");
+    }
 
     /// A finished OptiScaler install must not show a missing row: OptiScaler
     /// carries its own neural pass, so `renodx-dlss5.addon64` is never

@@ -14,6 +14,7 @@ mod net;
 mod ngx;
 mod quality_preset;
 mod renodx;
+mod report;
 mod reshade_ini;
 mod settings;
 mod text;
@@ -23,7 +24,7 @@ mod update;
 use std::io::Write;
 use std::path::PathBuf;
 
-/// `dlss5oneclick <GAME.exe | game folder> [--remove | --remove-all | --check | --diagnose | --engine=opti | --renodx | --upstream | --imports | --ignore-anticheat | --mode=feeder|native] | --update` runs headless; no args opens the GUI.
+/// `dlss5oneclick <GAME.exe | game folder> [--remove | --remove-all | --check | --diagnose | --report | --engine=opti|aio | --renodx | --upstream | --imports | --ignore-anticheat | --mode=feeder|native | --api=dx11|dx12 | --addon=latest|4.55|<tag>] | --update` runs headless; no args opens the GUI.
 /// Read by the NVIDIA and AMD drivers from this exe's export table to choose
 /// the discrete GPU for the whole process. Exported by the linker flags in
 /// build.rs; the values themselves are what the drivers read (#32).
@@ -155,6 +156,22 @@ error: {e:#}"
             std::process::exit(1);
         }
     }
+    if let Some(a) = args.iter().find_map(|a| a.strip_prefix("--addon=")) {
+        // "latest" lifts the 4.70 default; a bare number becomes a tag.
+        let v = if a.eq_ignore_ascii_case("latest") || a.starts_with("renodx-dlss5-") {
+            a.to_owned()
+        } else {
+            format!("renodx-dlss5-{a}")
+        };
+        std::env::set_var(installer::RENODX_TAG_ENV, v);
+    }
+    if let Some(a) = args.iter().find_map(|a| a.strip_prefix("--api=")) {
+        std::env::set_var(game::API_ENV, a);
+        if game::api_override().is_none() {
+            eprintln!("error: --api must be dx11 or dx12");
+            std::process::exit(1);
+        }
+    }
     if let Some(first) = args.first().filter(|a| !a.starts_with('-')) {
         attach_parent_console();
         let code = cli(
@@ -163,9 +180,12 @@ error: {e:#}"
             args.iter().any(|a| a == "--remove-all"),
             args.iter().any(|a| a == "--check"),
             args.iter().any(|a| a == "--diagnose"),
+            args.iter().any(|a| a == "--report"),
             Choice {
                 engine: if args.iter().any(|a| a == "--engine=opti" || a == "--opti") {
                     installer::Engine::Opti
+                } else if args.iter().any(|a| a == "--engine=aio" || a == "--aio") {
+                    installer::Engine::Aio
                 } else {
                     installer::Engine::ReShade
                 },
@@ -238,6 +258,7 @@ fn cli(
     remove_all: bool,
     check: bool,
     diagnose_only: bool,
+    report: bool,
     choice: Choice,
 ) -> i32 {
     let Choice {
@@ -268,6 +289,22 @@ fn cli(
         ));
     } else if !candidates.is_empty() {
         println!("{}", crate::trfmt!("using {}", "使用 {}", exe.display()));
+    }
+    if report {
+        return match report::write_bundle(&exe) {
+            Ok(p) => {
+                println!(
+                    "Report written: {}
+Attach that zip to the GitHub issue.",
+                    p.display()
+                );
+                0
+            }
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                1
+            }
+        };
     }
     if diagnose_only {
         return match diagnose::run(&exe) {
@@ -307,6 +344,12 @@ fn cli(
                 for p in &st.problems {
                     println!("  ! {}", text::tidy(p));
                 }
+                // No engine asked for: the plan follows what is in the folder.
+                let engine = match engine {
+                    installer::Engine::ReShade if st.opti => installer::Engine::Opti,
+                    installer::Engine::ReShade if st.aio => installer::Engine::Aio,
+                    e => e,
+                };
                 let names: Vec<&str> = installer::plan_with(&st, engine, with_renodx, upstream)
                     .iter()
                     .map(|s| lang::tr(s.name, s.name_zh))
@@ -441,6 +484,11 @@ fn cli(
                         "\nDone. In game: Insert opens the OptiScaler overlay -> enable Neural Rendering (off by default).",
                         "\n完成。游戏中：按 Insert 打开 OptiScaler 覆盖层 -> 启用神经渲染（默认关闭）。",
                     )
+                );
+            } else if engine == installer::Engine::Aio {
+                println!(
+                    "
+Done. In game: turn the game's own upscaling, anti-aliasing and frame generation off, run windowed; Home opens ReShade -> Add-ons tab -> Standalone DLSS-NR + SR."
                 );
             } else {
                 println!(
