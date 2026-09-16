@@ -290,18 +290,22 @@ pub enum Engine {
 
 const STEP_AIO: Step = Step {
     name: "DLSS5 ReShade AIO (standalone add-on)",
+    name_zh: "DLSS5 ReShade AIO（独立附加组件）",
     run: step_aio,
 };
 const STEP_AIO_RUNTIME: Step = Step {
     name: "NVIDIA DLSS + frame-generation runtimes",
+    name_zh: "NVIDIA DLSS + 帧生成运行时",
     run: step_aio_runtime,
 };
 const STEP_AIO_CONFIG: Step = Step {
     name: "ReShade config",
+    name_zh: "ReShade 配置",
     run: step_aio_config,
 };
 const STEP_AIO_CLEANUP: Step = Step {
     name: "Remove the standalone AIO add-on (another consumer replaces it)",
+    name_zh: "移除独立 AIO 附加组件（已由其它消费者取代）",
     run: step_aio_cleanup,
 };
 pub const AIO_REPO: &str = "kibblerz/DLSS5-Reshade-AIO";
@@ -893,6 +897,7 @@ const STEP_BRIDGE: Step = Step {
 };
 const STEP_MFG: Step = Step {
     name: "RTX 40 multi-frame generation add-on",
+    name_zh: "RTX 40 多帧生成附加组件",
     run: step_mfg,
 };
 const STEP_UPSTREAM: Step = Step {
@@ -909,6 +914,11 @@ const STEP_FEEDER_CLEANUP: Step = Step {
     name: "Remove DLSS5-Feeder (game has native DLSS)",
     name_zh: "移除 DLSS5-Feeder（游戏自带原生 DLSS）",
     run: step_feeder_cleanup,
+};
+const STEP_DLSS5_CLEANUP: Step = Step {
+    name: "Remove the RenoDX DLSS 5 add-on (Neural Upstream replaces it)",
+    name_zh: "移除 RenoDX DLSS 5 附加组件（由神经上游取代）",
+    run: step_dlss5_cleanup,
 };
 const STEP_REFRAMEWORK: Step = Step {
     name: "REFramework (RE Engine needs it before ReShade)",
@@ -1231,6 +1241,7 @@ fn plan_reshade_consumer(st: &GameStatus, upstream: bool) -> Vec<Step> {
             // DLSSNR feature and needs only the model beside it, so it takes
             // the RenoDX add-on's place rather than sitting next to it.
             if upstream {
+                v.push(STEP_DLSS5_CLEANUP);
                 v.push(STEP_UPSTREAM);
                 v.push(STEP_DLSSNR_ONLY);
             } else {
@@ -2310,6 +2321,42 @@ fn step_feeder_cleanup(
         100,
         lang::tr("DLSS5-Feeder removed; the add-on hooks the game's own DLSS", "已移除 DLSS5-Feeder；附加组件将挂钩游戏自带的 DLSS"),
     );
+    Ok(removed)
+}
+
+/// ReShade loads every add-on it finds.
+///
+/// They are not additive. Both detour `NVSDK_NGX_D3D12_CreateFeature` and
+/// `EvaluateFeature`, and both create NGX feature 18 on the same device. The
+/// second create is refused, so the user gets no neural rendering at all rather
+/// than one of the two implementations.
+fn step_dlss5_cleanup(
+    _c: &Client,
+    st: &GameStatus,
+    _w: &Path,
+    progress: Progress,
+) -> Result<Vec<String>> {
+    let mut removed = Vec::new();
+    let f = st.consumer_dir().join(game::DLSS5_ADDON);
+    if f.is_file() {
+        fs::remove_file(&f)?;
+        removed.push(game::DLSS5_ADDON.to_owned());
+        progress(
+            100,
+            lang::tr(
+                "RenoDX DLSS 5 add-on removed; Neural Upstream replaces it",
+                "已移除 RenoDX DLSS 5 附加组件；由神经上游取代",
+            ),
+        );
+    } else {
+        progress(
+            100,
+            lang::tr(
+                "no RenoDX DLSS 5 add-on to remove",
+                "没有需要移除的 RenoDX DLSS 5 附加组件",
+            ),
+        );
+    }
     Ok(removed)
 }
 

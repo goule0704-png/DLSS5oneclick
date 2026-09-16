@@ -946,14 +946,18 @@ const TILE_FEEDER32: Tile = Tile {
 
 const TILE_AIO: Tile = Tile {
     title: "Standalone AIO \u{00b7} experimental",
+    title_zh: "独立 AIO \u{00b7} 实验性",
     detail: "standalone-dlssnr.addon64 + nvngx.dll (kibblerz) \u{00b7} nvngx_dlssnr.dll",
+    detail_zh: "standalone-dlssnr.addon64 + nvngx.dll（kibblerz）\u{00b7} nvngx_dlssnr.dll",
     ok: |s| s.aio && s.dlssnr,
     optional: false,
 };
 
 const TILE_AIO_RUNTIME: Tile = Tile {
     title: "NVIDIA runtimes",
+    title_zh: "NVIDIA 运行时",
     detail: "nvngx_dlss.dll \u{00b7} nvngx_dlssg.dll for frame generation",
+    detail_zh: "nvngx_dlss.dll \u{00b7} nvngx_dlssg.dll（用于帧生成）",
     ok: |s| s.dlss,
     optional: false,
 };
